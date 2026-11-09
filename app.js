@@ -60,7 +60,16 @@ async function audit(action, details) {
 }
 
 // ---------- sign in & access ----------
+let linkError = "";
 async function boot() {
+  // A sign-in link that was too old comes back with an error in the address: explain it instead of looping.
+  const hp = new URLSearchParams(location.hash.slice(1) || location.search.slice(1));
+  if (hp.get("error_code") || hp.get("error_description")) {
+    linkError = hp.get("error_code") === "otp_expired" || /expired|invalid/i.test(hp.get("error_description") || "")
+      ? "That email link was an old one (each new email cancels the earlier links). Sign in with your password below, or send a new link and tap only the newest email."
+      : (hp.get("error_description") || "That sign-in link didn't work.");
+    history.replaceState(null, "", location.pathname);
+  }
   const { data } = await sb.auth.getSession();
   S.user = data.session?.user || null;
   sb.auth.onAuthStateChange((_e, session) => {
@@ -93,7 +102,8 @@ function renderMessage(title, text) {
 function renderSignIn() {
   const email = h("input", { type: "email", placeholder: "you@agency.gov", autocomplete: "email" });
   const pass = h("input", { type: "password", placeholder: "Password", autocomplete: "current-password" });
-  const msg = h("p", { class: "small" });
+  const msg = h("p", { class: linkError ? "small error" : "small" }, linkError);
+  linkError = "";
   const say = (ok, text) => { msg.className = ok ? "small ok" : "small error"; msg.textContent = text; };
   const addr = () => {
     const v = email.value.trim().toLowerCase();
@@ -111,13 +121,14 @@ function renderSignIn() {
     const v = addr(); if (!v) return;
     const { error } = await sb.auth.signInWithOtp({ email: v, options: { emailRedirectTo: location.origin + "/" } });
     if (error) say(false, error.message);
-    else say(true, "Check your email and tap the newest PlateTrace sign-in link on this device. Older links stop working.");
+    else say(true, "Sent. In Gmail, sign-in emails stack into one conversation: open the LAST message in it (tap 'Show quoted text' if needed) and tap its Sign in link. Older links stop working.");
   };
   $app.replaceChildren(h("form", { class: "card narrow", onsubmit: withPassword },
     h("h1", {}, "PlateTrace"),
     h("p", { class: "muted" }, "Plate enhancement and candidate reading for verified law enforcement and licensed investigators."),
     h("label", {}, "Work email", email),
     h("label", {}, "Password", pass),
+    h("p", { class: "small muted", style: "margin:4px 0 0" }, "Same password as your CashCow dashboard, if you have one."),
     h("button", { type: "submit", style: "margin-top:12px;width:100%" }, "Sign in"),
     h("button", { type: "button", class: "ghost", style: "margin-top:8px;width:100%", onclick: withLink }, "No password? Email me a sign-in link"),
     msg,
