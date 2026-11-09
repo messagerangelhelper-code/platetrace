@@ -92,20 +92,34 @@ function renderMessage(title, text) {
 
 function renderSignIn() {
   const email = h("input", { type: "email", placeholder: "you@agency.gov", autocomplete: "email" });
+  const pass = h("input", { type: "password", placeholder: "Password", autocomplete: "current-password" });
   const msg = h("p", { class: "small" });
-  const send = async (e) => {
-    e.preventDefault();
+  const say = (ok, text) => { msg.className = ok ? "small ok" : "small error"; msg.textContent = text; };
+  const addr = () => {
     const v = email.value.trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) { msg.className = "small error"; msg.textContent = "Enter a valid work email."; return; }
-    const { error } = await sb.auth.signInWithOtp({ email: v, options: { emailRedirectTo: location.origin + location.pathname } });
-    msg.className = error ? "small error" : "small ok";
-    msg.textContent = error ? error.message : "Check your email for a sign-in link. Open it on this device.";
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) { say(false, "Enter a valid work email."); return ""; }
+    return v;
   };
-  $app.replaceChildren(h("form", { class: "card narrow", onsubmit: send },
+  const withPassword = async (e) => {
+    e.preventDefault();
+    const v = addr(); if (!v) return;
+    if (!pass.value) { say(false, "Enter your password, or use the email link below."); return; }
+    const { error } = await sb.auth.signInWithPassword({ email: v, password: pass.value });
+    if (error) say(false, error.message === "Invalid login credentials" ? "That email and password don't match." : error.message);
+  };
+  const withLink = async () => {
+    const v = addr(); if (!v) return;
+    const { error } = await sb.auth.signInWithOtp({ email: v, options: { emailRedirectTo: location.origin + "/" } });
+    if (error) say(false, error.message);
+    else say(true, "Check your email and tap the newest PlateTrace sign-in link on this device. Older links stop working.");
+  };
+  $app.replaceChildren(h("form", { class: "card narrow", onsubmit: withPassword },
     h("h1", {}, "PlateTrace"),
     h("p", { class: "muted" }, "Plate enhancement and candidate reading for verified law enforcement and licensed investigators."),
     h("label", {}, "Work email", email),
-    h("button", { type: "submit", style: "margin-top:12px;width:100%" }, "Email me a sign-in link"),
+    h("label", {}, "Password", pass),
+    h("button", { type: "submit", style: "margin-top:12px;width:100%" }, "Sign in"),
+    h("button", { type: "button", class: "ghost", style: "margin-top:8px;width:100%", onclick: withLink }, "No password? Email me a sign-in link"),
     msg,
     h("p", { class: "small muted" }, "Use your official agency email. Personal email addresses are not approved.")));
 }
