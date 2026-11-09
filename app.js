@@ -705,6 +705,106 @@ function markedRear() {
   return c;
 }
 
+// ---------- Print & Pattern scan ----------
+const AREA_LABELS = ["Review", "Light / reflector", "Sticker / decal", "Repaint / mismatched panel", "Primer / bare metal", "Damage / scratch", "Wrap / graphics / stripe", "Ignore"];
+
+function printPatternScan(v) {
+  const img = v.combined, W = img.width, H = img.height, N = W * H, d = img.data;
+  const { gains } = whiteGains();
+  // lighting-corrected color and Lab for every pixel
+  const lab = new Float32Array(N * 3), corr = new Float32Array(N * 3), gray = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const c = [d[i * 4] * gains[0], d[i * 4 + 1] * gains[1], d[i * 4 + 2] * gains[2]].map((x) => clamp(x, 0, 255));
+    corr.set(c, i * 3); lab.set(toLab(c), i * 3);
+    gray[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  }
+  // main body color: sample A if taken, otherwise the most common corrected color of the rear
+  let ref;
+  if (v.samples?.length) ref = toLab(v.samples[0].corrected.rgb);
+  else {
+    const bins = new Map();
+    for (let i = 0; i < N; i += 3) { const k = [0, 1, 2].map((c) => Math.round(corr[i * 3 + c] / 24)).join(","); bins.set(k, (bins.get(k) || 0) + 1); }
+    const top = [...bins.entries()].sort((a, b) => b[1] - a[1])[0][0].split(",").map((x) => +x * 24);
+    ref = toLab(top);
+  }
+  // the plate area (already read in step 4) is left out of the search for odd areas
+  const sc = v.scale, pb = { x: (C.box.x - v.box.x) * sc, y: (C.box.y - v.box.y) * sc, w: C.box.w * sc, h: C.box.h * sc };
+  const inPlate = (x, y) => x >= pb.x - 4 && x <= pb.x + pb.w + 4 && y >= pb.y - 4 && y <= pb.y + pb.h + 4;
+
+  // 1) color difference map
+  const de = new Float32Array(N);
+  const diff = new ImageData(W, H);
+  for (let i = 0; i < N; i++) {
+    de[i] = Math.hypot(lab[i * 3] - ref[0], lab[i * 3 + 1] - ref[1], lab[i * 3 + 2] - ref[2]);
+    // gray where the paint matches; yellow for small differences, red for big ones
+    const g = gray[i] * 0.55, t = clamp((de[i] - 8) / 32, 0, 1), mix = Math.min(1, t * 1.6);
+    const ramp = [255, 220 - 180 * t, 30 * (1 - t)];
+    diff.data.set([g + (ramp[0] - g) * mix, g + (ramp[1] - g) * mix, g + (ramp[2] - g) * mix, 255], i * 4);
+  }
+  // 2) detail map: fine texture lifted out of the slow shading
+  const blur = boxBlur(boxBlur(gray, W, H, 5), W, H, 5), detail = new ImageData(W, H);
+  for (let i = 0; i < N; i++) { const val = clamp(128 + (gray[i] - blur[i]) * 5, 0, 255); detail.data.set([val, val, val, 255], i * 4); }
+  // 3) paint print: 8 x 4 grid of corrected colors
+  const cols = 8, rows = 4, cells = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const box = { x: Math.floor((c * W) / cols), y: Math.floor((r * H) / rows), w: Math.floor(W / cols), h: Math.floor(H / rows) };
+    const m = medianColor(img, box).map((x, k) => clamp(x * gains[k], 0, 255)).map(Math.round);
+    cells.push({ row: r + 1, col: c + 1, rgb: m, hex: rgbToHex(m), name: colorName(m) });
+  }
+  const sw = 40, printC = canvasOf(cols * sw, rows * sw), px = printC.getContext("2d");
+  cells.forEach((cl) => { px.fillStyle = cl.hex; px.fillRect((cl.col - 1) * sw, (cl.row - 1) * sw, sw, sw); });
+  // 4) areas that stand out: coarse grid, flood-fill neighbours, keep the meaningful ones
+  const cell = Math.max(4, Math.round(Math.min(W, H) / 60)), gw = Math.ceil(W / cell), gh = Math.ceil(H / cell);
+  const flag = new Uint8Array(gw * gh), cellLab = new Float32Array(gw * gh * 3);
+  for (let gy = 0; gy < gh; gy++) for (let gx = 0; gx < gw; gx++) {
+    let sum = 0, n = 0; const L = [0, 0, 0];
+    for (let y = gy * cell; y < Math.min(H, (gy + 1) * cell); y++) for (let x = gx * cell; x < Math.min(W, (gx + 1) * cell); x++) {
+      if (inPlate(x, y)) continue;
+      const q = y * W + x; sum += de[q]; n++; L[0] += lab[q * 3]; L[1] += lab[q * 3 + 1]; L[2] += lab[q * 3 + 2];
+    }
+    const k = gy * gw + gx;
+    flag[k] = n && sum / n > 10 ? 1 : 0;
+    if (n) cellLab.set(L.map((v) => v / n), k * 3);
+  }
+  // neighbouring cells only join one area when their colors are alike (keeps a light apart from the panel beside it)
+  const alike = (a, b) => Math.hypot(cellLab[a * 3] - cellLab[b * 3], cellLab[a * 3 + 1] - cellLab[b * 3 + 1], cellLab[a * 3 + 2] - cellLab[b * 3 + 2]) < 16;
+  const seen = new Uint8Array(gw * gh), areas = [];
+  for (let i = 0; i < flag.length; i++) {
+    if (!flag[i] || seen[i]) continue;
+    const stack = [i]; seen[i] = 1; let minx = 1e9, miny = 1e9, maxx = -1, maxy = -1, count = 0;
+    while (stack.length) {
+      const k = stack.pop(), x = k % gw, y = (k / gw) | 0; count++;
+      minx = Math.min(minx, x); maxx = Math.max(maxx, x); miny = Math.min(miny, y); maxy = Math.max(maxy, y);
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy, nk = ny * gw + nx;
+        if (nx >= 0 && ny >= 0 && nx < gw && ny < gh && flag[nk] && !seen[nk] && alike(k, nk)) { seen[nk] = 1; stack.push(nk); }
+      }
+    }
+    if (count < Math.max(3, flag.length * 0.004)) continue;
+    if (minx === 0 && miny === 0 && maxx === gw - 1 && maxy === gh - 1) continue;   // the background around the vehicle
+    const pad = cell, box = { x: Math.max(0, minx * cell - pad), y: Math.max(0, miny * cell - pad) };
+    box.w = Math.min(W, (maxx + 1) * cell + pad) - box.x; box.h = Math.min(H, (maxy + 1) * cell + pad) - box.y;
+    let sumDe = 0, n = 0; const acc = [0, 0, 0];
+    for (let y = box.y; y < box.y + box.h; y++) for (let x = box.x; x < box.x + box.w; x++) { const q = y * W + x; if (de[q] > 10) { sumDe += de[q]; n++; acc[0] += corr[q * 3]; acc[1] += corr[q * 3 + 1]; acc[2] += corr[q * 3 + 2]; } }
+    const mean = acc.map((a) => Math.round(a / Math.max(1, n)));
+    const crop = canvasOf(box.w, box.h); crop.getContext("2d").putImageData(img, -box.x, -box.y);
+    areas.push({ box, size_pct: +((count / flag.length) * 100).toFixed(1), difference: +(sumDe / Math.max(1, n)).toFixed(1), color: { rgb: mean, hex: rgbToHex(mean), name: colorName(mean) }, crop, label: "Review" });
+  }
+  areas.sort((a, b) => b.size_pct * b.difference - a.size_pct * a.difference);
+  areas.splice(12);
+  areas.forEach((a, i) => (a.n = i + 1));
+  return { reference_lab: ref.map((x) => +x.toFixed(1)), diff, detail, printC, cells, areas };
+}
+
+function outlinedDiff(scan) {
+  const c = canvasFromData(scan.diff), x = c.getContext("2d"), lw = Math.max(2, c.width / 250);
+  scan.areas.forEach((a) => {
+    x.strokeStyle = "#4fb3ff"; x.lineWidth = lw; x.strokeRect(a.box.x, a.box.y, a.box.w, a.box.h);
+    x.fillStyle = "#4fb3ff"; x.font = `bold ${Math.round(lw * 7)}px sans-serif`; x.textBaseline = "bottom"; x.fillText(String(a.n), a.box.x + 2, a.box.y - 2);
+  });
+  return c;
+}
+
 async function vehicleStep(stage) {
   const isVideo = C.kind === "video";
   const used = C.frames.filter((f) => f.use);
@@ -744,7 +844,7 @@ async function vehicleStep(stage) {
     }
     if (!imgs.length) { status.className = "small error"; status.textContent = "The back of the vehicle didn't line up across frames. Try a tighter box."; combineBtn.disabled = false; return; }
     C.vehicle.combined = averageFrames(imgs);
-    C.vehicle.frames = imgs.length; C.vehicle.scale = scale; C.vehicle.marks = []; C.vehicle.samples = []; C.vehicle.finish = C.vehicle.finish || "Not sure";
+    C.vehicle.frames = imgs.length; C.vehicle.scale = scale; C.vehicle.marks = []; C.vehicle.samples = []; C.vehicle.scan = null; C.vehicle.finish = C.vehicle.finish || "Not sure";
     logStep("vehicle_combined", { rear_box: box, frames_combined: imgs.length, detail_factor: scale });
     showDetails();
     combineBtn.disabled = false;
@@ -809,6 +909,34 @@ async function vehicleStep(stage) {
       if (b.w >= 4 && b.h >= 4) measure(b);
     });
     repaint(); showMarks(); showPaint();
+    const scanOut = h("div", {});
+    const showScan = () => {
+      const sc = v.scan;
+      if (!sc) return;
+      scanOut.replaceChildren(
+        h("p", { class: "small muted" }, "A camera records only the surface, so this can't see under the paint. It brings out what's faint in the surface: color changes, texture and patterns. Lights, the plate and reflectors will also show up; label them so they're set aside."),
+        h("div", { class: "result-imgs" },
+          h("figure", { style: "margin:0" }, h("img", { src: outlinedDiff(sc).toDataURL(), alt: "Color difference map" }), h("figcaption", { class: "small muted" }, "Color difference map: yellow to red = paint differs from the main body color (lighting-corrected). Numbered boxes = areas that stand out.")),
+          h("figure", { style: "margin:0" }, h("img", { src: canvasFromData(sc.detail).toDataURL(), alt: "Detail map" }), h("figcaption", { class: "small muted" }, "Detail map: fine texture lifted out, showing scratches, dent ripples, stripes, sticker and wrap edges."))),
+        h("h3", {}, "Paint print"),
+        h("img", { src: sc.printC.toDataURL(), alt: "Paint print", style: "width:100%;max-width:420px;image-rendering:pixelated;border-radius:8px" }),
+        h("p", { class: "small muted" }, "The vehicle's corrected colors on an 8 × 4 grid, like a color barcode. Compare it with another case or a suspect vehicle filmed in similar light."),
+        h("h3", {}, `Areas that stand out (${sc.areas.length})`),
+        sc.areas.length ? h("div", { class: "thumbs" }, sc.areas.map((a) => h("figure", {},
+          h("img", { src: a.crop.toDataURL(), alt: `Area ${a.n}` }),
+          h("figcaption", {}, `#${a.n} · ${a.color.name} · ${a.difference} diff · ${a.size_pct}%`,
+            h("select", { style: "margin-top:4px;padding:4px 6px;font-size:12px", onchange: (e) => { a.label = e.target.value; logStep("pattern_area_labeled", { n: a.n, label: a.label }); } },
+              AREA_LABELS.map((l) => h("option", { selected: l === a.label }, l)))))))
+          : h("p", { class: "small muted" }, "No areas stood out from the main body color."));
+    };
+    const scanBtn = h("button", { onclick: async () => {
+      scanBtn.disabled = true; scanBtn.textContent = "Scanning…";
+      await new Promise((r) => setTimeout(r, 30));
+      v.scan = printPatternScan(v);
+      logStep("print_pattern_scan", { reference_lab: v.scan.reference_lab, areas: v.scan.areas.map((a) => ({ n: a.n, box: a.box, color: a.color.hex, difference: a.difference, size_pct: a.size_pct })), paint_print: v.scan.cells.map((c) => c.hex) });
+      showScan(); scanBtn.disabled = false; scanBtn.textContent = "🔍 Run Print & Pattern scan again";
+    } }, v.scan ? "🔍 Run Print & Pattern scan again" : "🔍 Print & Pattern scan");
+    showScan();
     work.replaceChildren(
       h("h3", {}, `Back of the vehicle (${v.frames} frames combined)`),
       h("div", { class: "stage" }, pic, over),
@@ -816,6 +944,7 @@ async function vehicleStep(stage) {
       h("h3", {}, "Paint: color, finish and pattern"),
       h("label", { style: "max-width:420px" }, "Finish / pattern you can see", finish),
       paintOut,
+      h("h3", {}, "Print & Pattern"), h("p", { class: "small muted" }, "Tip: take paint sample A on the main body color first; the scan compares everything with it."), scanBtn, scanOut,
       h("h3", {}, "Distinguishing marks"), list,
       h("p", { class: "small muted" }, "Coming in stage 2: make, model and year from the vehicle's shape, and matching the color to manufacturer paint codes."));
   };
@@ -844,6 +973,13 @@ function packageStep(stage) {
     if (C.vehicle?.combined) {
       await add("vehicle_rear_combined.png", canvasFromData(C.vehicle.combined));
       await add("vehicle_rear_marked.png", markedRear());
+      if (C.vehicle.scan) {
+        const sc = C.vehicle.scan;
+        await add("print_pattern/color_difference_map.png", outlinedDiff(sc));
+        await add("print_pattern/detail_map.png", canvasFromData(sc.detail));
+        await add("print_pattern/paint_print.png", sc.printC);
+        for (const a of sc.areas) await add(`print_pattern/area_${String(a.n).padStart(2, "0")}.png`, a.crop);
+      }
     }
     logStep("package_built", { files: manifest.length });
     const report = {
@@ -856,7 +992,10 @@ function packageStep(stage) {
       read_settings: C.readSettings, reads: C.reads, candidates: C.candidates,
       vehicle: C.vehicle ? { rear_box: C.vehicle.box, frames_combined: C.vehicle.frames, paint_finish: C.vehicle.finish || null,
         paint_samples: (C.vehicle.samples || []).map((sm) => ({ label: sm.label, box: sm.box, as_recorded: sm.raw, corrected: sm.corrected, surface: sm.evenness, difference_from_A: sm.delta, possible_panel_mismatch: sm.flag })),
-        white_reference_from_plate: C.vehicle.samples?.[0]?.white_reference_from_plate || null, marks: C.vehicle.marks } : null,
+        white_reference_from_plate: C.vehicle.samples?.[0]?.white_reference_from_plate || null, marks: C.vehicle.marks,
+        print_pattern: C.vehicle.scan ? { method: "lighting-corrected CIE76 color difference vs main body color; high-pass detail map; 8x4 median color grid",
+          reference_lab: C.vehicle.scan.reference_lab, paint_print: C.vehicle.scan.cells,
+          areas: C.vehicle.scan.areas.map((a) => ({ n: a.n, box: a.box, label: a.label, color: a.color, difference: a.difference, size_pct: a.size_pct, image: `print_pattern/area_${String(a.n).padStart(2, "0")}.png` })) } : null } : null,
       outputs: manifest, log: C.log,
       notice: "Candidates are investigative leads, not identification. Verify against the original footage and agency records. Enhancement only rescales and averages recorded pixels; no generative AI was used.",
     };
@@ -869,6 +1008,7 @@ function packageStep(stage) {
       "frames/  each lined-up frame used",
       "vehicle_rear_combined.png / vehicle_rear_marked.png  the back of the vehicle, combined, with numbered marks", "",
       ...(C.vehicle?.samples?.length ? [`Paint finish/pattern: ${C.vehicle.finish || "not noted"}`, ...C.vehicle.samples.map((sm) => `  Sample ${sm.label}: ${sm.corrected.name} ${sm.corrected.hex} (as recorded ${sm.raw.hex}), surface ${sm.evenness.label}${sm.flag ? `, ${sm.delta} different from A: possible repainted/replaced panel` : ""}`)] : []),
+      ...(C.vehicle?.scan ? ["Print & Pattern scan: print_pattern/ (difference map, detail map, paint print, area photos)", ...C.vehicle.scan.areas.map((a) => `  Area ${a.n}: ${a.label}, ${a.color.name} ${a.color.hex}, difference ${a.difference}, ${a.size_pct}% of rear`)] : []),
       ...(C.vehicle?.marks?.length ? ["Distinguishing marks:", ...C.vehicle.marks.map((m) => `  ${m.n}. ${m.type}${m.note ? " — " + m.note : ""}`)] : []), "",
       "Top candidates:", ...C.candidates.slice(0, 5).map((c, i) => `  ${i + 1}. ${c.plate}  ${c.agreement}%  ${c.note || ""}`), "",
       "To verify an image: compute its SHA-256 and compare it to case_report.json → outputs.",
