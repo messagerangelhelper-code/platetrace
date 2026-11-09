@@ -61,7 +61,10 @@ async function audit(action, details) {
 
 // ---------- sign in & access ----------
 let linkError = "";
+let resetting = false;
 async function boot() {
+  // Arrived from a "reset password" email: show the new-password form once signed in.
+  if (new URLSearchParams(location.search).get("reset") === "1" || /type=recovery/.test(location.hash)) resetting = true;
   // A sign-in link that was too old comes back with an error in the address: explain it instead of looping.
   const hp = new URLSearchParams(location.hash.slice(1) || location.search.slice(1));
   if (hp.get("error_code") || hp.get("error_description")) {
@@ -72,7 +75,8 @@ async function boot() {
   }
   const { data } = await sb.auth.getSession();
   S.user = data.session?.user || null;
-  sb.auth.onAuthStateChange((_e, session) => {
+  sb.auth.onAuthStateChange((ev, session) => {
+    if (ev === "PASSWORD_RECOVERY") resetting = true;
     const was = S.user?.id;
     S.user = session?.user || null;
     if ((S.user?.id || null) !== (was || null)) route();
@@ -83,6 +87,7 @@ async function boot() {
 async function route() {
   $who.replaceChildren();
   if (!S.user) return renderSignIn();
+  if (resetting) return renderNewPassword();
   S.isAdmin = ADMIN_EMAILS.includes(String(S.user.email || "").toLowerCase());
   $who.append(S.user.email, h("button", { class: "ghost", onclick: async () => { await sb.auth.signOut(); } }, "Sign out"));
   const { data, error } = await sb.from("platetrace_access").select("*").eq("user_id", S.user.id).maybeSingle();
@@ -93,6 +98,30 @@ async function route() {
   if (data.status === "approved") return renderTool(false);
   if (data.status === "rejected") return renderMessage("Access not approved", data.note || "Your request wasn't approved. Contact PlateTrace if you think this is a mistake.");
   renderMessage("Verification in progress", `Thanks, ${data.full_name}. We verify every agency before turning access on, usually within 1–2 business days. We may call your supervisor at the number you gave.`);
+}
+
+function renderNewPassword() {
+  const p1 = h("input", { type: "password", placeholder: "New password (8+ characters)", autocomplete: "new-password" });
+  const p2 = h("input", { type: "password", placeholder: "Type it again", autocomplete: "new-password" });
+  const msg = h("p", { class: "small" });
+  const save = async (e) => {
+    e.preventDefault();
+    if (p1.value.length < 8) { msg.className = "small error"; msg.textContent = "Use at least 8 characters."; return; }
+    if (p1.value !== p2.value) { msg.className = "small error"; msg.textContent = "The two passwords don't match."; return; }
+    const { error } = await sb.auth.updateUser({ password: p1.value });
+    if (error) { msg.className = "small error"; msg.textContent = error.message; return; }
+    resetting = false;
+    history.replaceState(null, "", location.pathname);
+    msg.className = "small ok"; msg.textContent = "Password saved. Opening PlateTrace…";
+    setTimeout(route, 900);
+  };
+  $app.replaceChildren(h("form", { class: "card narrow", onsubmit: save },
+    h("h1", {}, "Set a new password"),
+    h("p", { class: "muted" }, "Signed in as " + (S.user?.email || "") + ". Choose a new password you'll use from now on."),
+    h("label", {}, "New password", p1),
+    h("label", {}, "Confirm", p2),
+    h("button", { type: "submit", style: "margin-top:12px;width:100%" }, "Save password"),
+    msg));
 }
 
 function renderMessage(title, text) {
@@ -123,6 +152,12 @@ function renderSignIn() {
     if (error) say(false, error.message);
     else say(true, "Sent. In Gmail, sign-in emails stack into one conversation: open the LAST message in it (tap 'Show quoted text' if needed) and tap its Sign in link. Older links stop working.");
   };
+  const forgot = async () => {
+    const v = addr(); if (!v) return;
+    const { error } = await sb.auth.resetPasswordForEmail(v, { redirectTo: location.origin + "/?reset=1" });
+    if (error) say(false, /rate|seconds/i.test(error.message) ? "Please wait a minute, then try again." : error.message);
+    else say(true, "Sent. Open the newest \"Reset password\" email and tap its link. You'll come back here to choose a new password.");
+  };
   $app.replaceChildren(h("form", { class: "card narrow", onsubmit: withPassword },
     h("h1", {}, "PlateTrace"),
     h("p", { class: "muted" }, "Plate enhancement and candidate reading for verified law enforcement and licensed investigators."),
@@ -130,6 +165,7 @@ function renderSignIn() {
     h("label", {}, "Password", pass),
     h("p", { class: "small muted", style: "margin:4px 0 0" }, "Same password as your CashCow dashboard, if you have one."),
     h("button", { type: "submit", style: "margin-top:12px;width:100%" }, "Sign in"),
+    h("button", { type: "button", class: "ghost", style: "margin-top:8px;width:100%", onclick: forgot }, "Forgot password? Email me a reset link"),
     h("button", { type: "button", class: "ghost", style: "margin-top:8px;width:100%", onclick: withLink }, "No password? Email me a sign-in link"),
     msg,
     h("p", { class: "small muted" }, "Use your official agency email. Personal email addresses are not approved.")));
