@@ -13,7 +13,7 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 const $app = document.getElementById("app");
 const $who = document.getElementById("who");
 
-const S = { user: null, access: null, isAdmin: false, ocr: null };
+const S = { user: null, access: null, isAdmin: false, ocr: null, publicMode: false };
 let C = null;                                   // the open case
 
 // ---------- small helpers ----------
@@ -94,9 +94,12 @@ async function route() {
   const { data, error } = await sb.from("platetrace_access").select("*").eq("user_id", S.user.id).maybeSingle();
   if (error) return renderMessage("Can't check your access", "The access table isn't set up yet, or the connection failed. " + error.message);
   S.access = data;
+  const set = await sb.from("platetrace_settings").select("public_mode").eq("id", 1).maybeSingle();
+  S.publicMode = !!set.data?.public_mode;
   if (S.isAdmin) return renderTool(true);
+  if (data?.status === "approved") return renderTool(false);
+  if (S.publicMode) return renderTool(false);
   if (!data) return renderRequest();
-  if (data.status === "approved") return renderTool(false);
   if (data.status === "rejected") return renderMessage("Access not approved", data.note || "Your request wasn't approved. Contact PlateTrace if you think this is a mistake.");
   renderMessage("Verification in progress", `Thanks, ${data.full_name}. We verify every agency before turning access on, usually within 1–2 business days. We may call your supervisor at the number you gave.`);
 }
@@ -238,14 +241,31 @@ function renderTool(isAdmin) {
     renderWork();
   };
   const adminBox = h("div", {});
-  $app.replaceChildren(
+  const switchMsg = h("p", { class: "small muted" });
+  const switchBtn = h("button", { class: S.publicMode ? "" : "ghost", onclick: async () => {
+    const next = !S.publicMode;
+    if (next && !confirm("Turn on PUBLIC TEST MODE? Anyone who signs in can use PlateTrace without verification.")) return;
+    switchBtn.disabled = true;
+    const { error } = await sb.from("platetrace_settings").update({ public_mode: next, updated_at: nowIso() }).eq("id", 1);
+    switchBtn.disabled = false;
+    if (error) { switchMsg.className = "small error"; switchMsg.textContent = "Couldn't change it: " + error.message; return; }
+    S.publicMode = next; renderTool(true);
+  } }, S.publicMode ? "Public test mode: ON (tap to make private)" : "Private: verified only (tap to make public)");
+  const testBanner = !isAdmin && S.publicMode && S.access?.status !== "approved"
+    ? h("div", { class: "card", style: "border:2px solid #f5a623" }, h("strong", {}, "Test mode. "),
+        h("span", { class: "small" }, "PlateTrace is open for testing right now. Full access still needs agency verification."))
+    : null;
+  $app.replaceChildren(...[
+    isAdmin ? h("div", { class: "card" }, h("h2", {}, "Who can use PlateTrace"),
+      h("p", { class: "small muted" }, "Private = only verified agencies. Public = anyone who signs in can test it."), switchBtn, switchMsg) : null,
+    testBanner,
     isAdmin ? h("div", { class: "card" }, h("h2", {}, "Access requests"), adminBox) : null,
     h("div", { class: "card" },
       h("h1", {}, "New case"),
       h("p", { class: "muted small" }, "Load a video clip, or several photos of the same vehicle. Nothing is uploaded; processing happens on this device."),
       h("div", { class: "row" }, h("label", {}, "Case number", caseNo), h("label", {}, "Examiner", examiner)),
       h("label", {}, "Footage", file),
-      h("button", { style: "margin-top:12px", onclick: start }, "Open case"), msg));
+      h("button", { style: "margin-top:12px", onclick: start }, "Open case"), msg)].filter(Boolean));
   if (isAdmin) renderAdmin(adminBox);
 }
 
