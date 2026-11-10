@@ -656,7 +656,7 @@ function combineStep(stage) {
 // Standard passenger layouts. Vanity, specialty, dealer and older plates differ: use "Custom" or "Any" for those.
 const FORMATS = {
   any: { label: "Any state / unknown", pattern: [] },
-  tx: { label: "Texas passenger (ABC1234)", pattern: ["LLLNNNN"] },
+  tx: { label: "Texas passenger (ABC1234, no vowels or Q)", pattern: ["LLLNNNN"] },
   ca: { label: "California passenger (1ABC234)", pattern: ["NLLLNNN"] },
   l3n4: { label: "ABC1234: AZ, GA, MI, NY, NC, OH, PA, VA, WA and others", pattern: ["LLLNNNN"] },
   md: { label: "1AB2345: Maryland", pattern: ["NLLNNNN"] },
@@ -758,6 +758,7 @@ function partialList(maskStr, fmt, customPattern, noIOQ, reads) {
       const want = pat[i] || "";
       let pool = want === "L" ? LETTERS : want === "N" ? DIGITS : LETTERS + DIGITS;
       if (noIOQ && want === "L") pool = pool.replace(/[IOQ]/g, "");
+      if (fmt === "tx" && want === "L") pool = pool.replace(/[AEIOUQ]/g, "");   // Texas general issue: no vowels, no Q
       if (ch !== "?") { if (!pool.includes(ch)) okMask = false; return [[ch, 1]]; }
       const votes = {}; let sum = 0;
       group.forEach((r) => {
@@ -863,11 +864,35 @@ function readStep(stage) {
     go.disabled = false;
   };
   const go = h("button", { onclick: run }, "Read the plate");
+
+  // Match test: compare against real Texas Classic character shapes, blurred like the footage.
+  const mStatus = h("p", { class: "small muted" }), mBar = h("i", {}), mOut = h("div", {});
+  const mGo = h("button", { class: "ghost", onclick: async () => {
+    mGo.disabled = true; mOut.replaceChildren(); mStatus.className = "small muted"; mStatus.textContent = "Comparing against Texas plate shapes… (can take up to a minute on a phone)";
+    try {
+      const r = await PTMatch.run(C.combinedRaw, {}, (f) => (mBar.style.width = `${Math.round(f * 100)}%`));
+      C.match = r;
+      logStep("match_test", { result: r.plate, fit: r.fit, blur_sigma_px: r.blur_sigma_px, positions: r.positions.map((p) => `${p.pos}:${p.result} (${p.top.map((t) => t.ch + " " + t.share + "%").join(", ")}; stable ${p.stable})`) });
+      const known = r.mask.replace(/\?/g, "").length;
+      mStatus.textContent = r.enough_detail ? `Fit with the footage: ${Math.round(r.fit * 100)}%. ${known} of 7 characters passed every check.` : `Fit with the footage is only ${Math.round(r.fit * 100)}%, so no characters are reported. The footage may not hold enough detail, or this may not be a Texas Classic plate.`;
+      mOut.replaceChildren(
+        h("p", { class: "plate", style: "font-size:28px;letter-spacing:4px;margin:6px 0" }, r.plate),
+        h("table", {}, h("tr", {}, h("th", {}, "Spot"), h("th", {}, "Result"), h("th", {}, "Best matches (share)"), h("th", {}, "Stable")),
+          r.positions.map((p) => h("tr", {}, h("td", {}, p.pos), h("td", { class: "plate" }, p.result),
+            h("td", { class: "small" }, p.top.map((t) => `${t.ch} ${t.share}%`).join(" · ")), h("td", { class: "small muted" }, p.stable)))),
+        h("p", { class: "small muted" }, r.rule),
+        known && known < 7 ? h("button", { class: "ghost", style: "margin-top:8px", onclick: () => { fmt.value = "tx"; mask.value = r.mask; run(); } }, `Use ${r.mask} as known characters and build the search list`) : "");
+    } catch (e) { mStatus.className = "small error"; mStatus.textContent = "The Match test couldn't run: " + (e.message || e); }
+    mGo.disabled = false;
+  } }, "Run Match test (Texas Classic)");
+  const matchCard = h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Match test (Texas Classic plates)"),
+    h("p", { class: "small muted" }, "Compares the combined image against real Texas plate letters and numbers, blurred to match the footage. It doesn't guess: a spot shows ? unless one character clearly wins and keeps winning when the fit is re-run. For the white Texas Classic plate (ABC-1234 with the Texas outline) only."),
+    mGo, h("div", { class: "progress" }, mBar), mStatus, mOut);
   stage.replaceChildren(stepsBar(4), h("h2", {}, "Read the plate"),
     h("div", { class: "row" }, h("label", {}, "State / plate layout", fmt, custom), h("label", {}, "Known characters (? = unknown)", mask)),
     h("label", { class: "small", style: "display:flex;gap:8px;align-items:center;margin-top:6px" }, noIOQ, "This state doesn't issue the letters I, O or Q (many don't; check yours). Removes them from the guesses."),
     h("p", { class: "small muted" }, "Tip: type the characters you can see and put ? for the ones you can't (e.g. 7?K4?2). PlateTrace then lists every plate that fits, ranked."),
-    h("div", { style: "margin-top:10px" }, go), h("div", { class: "progress" }, bar), status, results, h("div", { style: "margin-top:12px" }, next));
+    h("div", { style: "margin-top:10px" }, go), h("div", { class: "progress" }, bar), status, results, matchCard, h("div", { style: "margin-top:12px" }, next));
 }
 
 // ---------- step 5: vehicle details (the rest of the "fingerprint") ----------
@@ -1291,6 +1316,13 @@ async function buildReportPdf(report, images) {
     table([{ label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }, { label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }],
       Array.from({ length: Math.ceil(pl.length / 2) }, (_, i) => [i + 1, pl[i].plate, pl[i].rank_score, pl[i + 15] ? i + 16 : "", pl[i + 15]?.plate || "", pl[i + 15]?.rank_score ?? ""]), [40, 90, 54, 40, 90, 54]);
   }
+  if (report.match_test) {
+    const mt = report.match_test;
+    y -= 6; text(`Match test (Texas Classic): ${mt.plate}`, { size: 10, f: bold });
+    text(`Method: ${mt.method}. Character shapes: ${mt.templates}. Fit with the footage ${Math.round(mt.fit * 100)}%, estimated blur ${mt.blur_sigma_px} px. ${mt.rule}`, { size: 8.5 });
+    table([{ label: "Spot" }, { label: "Result", mono: true }, { label: "Best matches (share)" }, { label: "Stable" }],
+      mt.positions.map((p) => [p.pos, p.result, p.top.map((t) => `${t.ch} ${t.share}%`).join(", "), p.stable]), [36, 50, TW - 140, 54], 8.5);
+  }
   y -= 6; text("All reads (for transparency):", { size: 9, f: bold });
   table([{ label: "Version read" }, { label: "Text", mono: true }, { label: "Reader confidence" }], report.reads.map((r) => [r.source, r.text || "-", r.conf + "%"]), [220, 140, TW - 360], 8.5);
 
@@ -1360,7 +1392,7 @@ function packageStep(stage) {
       plate_box: C.box, reference_time_s: C.refTime ?? null,
       frames: used.map((f, i) => ({ n: i + 1, at: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp, weight: f.weight ?? 1 })),
       processing: { ...C.params, alignment: "normalized cross-correlation with sub-pixel parabola fit", combining: "mean of aligned frames" },
-      read_settings: C.readSettings, reads: C.reads, candidates: C.candidates,
+      read_settings: C.readSettings, reads: C.reads, candidates: C.candidates, match_test: C.match || null,
       partial_list: C.partial ? { ...C.partial, list: C.partial.list?.slice(0, 200) || [], full_list_file: C.partial.error ? null : "partial_plate_list.csv" } : null,
       vehicle: C.vehicle ? { rear_box: C.vehicle.box, frames_combined: C.vehicle.frames, paint_finish: C.vehicle.finish || null,
         paint_samples: (C.vehicle.samples || []).map((sm) => ({ label: sm.label, box: sm.box, as_recorded: sm.raw, corrected: sm.corrected, surface: sm.evenness, difference_from_A: sm.delta, possible_panel_mismatch: sm.flag })),
