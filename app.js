@@ -720,6 +720,87 @@ function combineStep(stage) {
     h("div", { style: "margin-top:12px" }, next));
 }
 
+
+// ---------- reflection search ----------
+// Looks across whole frames for a second view of the plate: mirrored (shop window, shiny paint),
+// upside down (puddle, wet road), smaller or larger. Only reports places that match the marked plate;
+// a person must confirm each one by eye.
+async function grabFullFrames(max) {
+  const isVideo = C.kind === "video", out = [];
+  const W = isVideo ? C.video.videoWidth : C.images[0].width, H = isVideo ? C.video.videoHeight : C.images[0].height;
+  const keys = isVideo ? [C.refTime, ...C.frames.filter((f) => f.use).map((f) => f.key)] : C.images.map((_, i) => i);
+  const seen = new Set();
+  for (const k of keys) {
+    const id = isVideo ? k.toFixed(2) : k; if (seen.has(id)) continue; seen.add(id);
+    const c = canvasOf(W, H), x = c.getContext("2d");
+    if (isVideo) { await seekTo(C.video, k); x.drawImage(C.video, 0, 0); } else x.drawImage(C.images[k], 0, 0);
+    out.push({ at: isVideo ? +k.toFixed(3) : C.files[k].name, canvas: c });
+    if (out.length >= max) break;
+  }
+  return out;
+}
+function grayOf(canvas, w, hgt) {
+  const c = canvasOf(w, hgt), x = c.getContext("2d"); x.imageSmoothingQuality = "high"; x.drawImage(canvas, 0, 0, w, hgt);
+  return grayRegion(x, 0, 0, w, hgt);
+}
+async function reflectionSearch(onProgress) {
+  const frames = await grabFullFrames(2), b = C.box;
+  const W = frames[0].canvas.width, H = frames[0].canvas.height, f = Math.min(1, 640 / W), sw = Math.round(W * f), sh = Math.round(H * f);
+  const ref = frames[0].canvas, flips = [["as is", 1, 1], ["mirrored left-right", -1, 1], ["upside down", 1, -1], ["mirrored and upside down", -1, -1]];
+  const soft = (g, w, hh) => boxBlur(boxBlur(g, w, hh, 1), w, hh, 1);   // a little softening so near-miss sizes still match on the first pass
+  const makeTpl = (s, fx, fy, blur) => {
+    const tw = Math.round(b.w * f * s), th = Math.round(b.h * f * s), c = canvasOf(tw, th), x = c.getContext("2d");
+    x.translate(fx < 0 ? tw : 0, fy < 0 ? th : 0); x.scale(fx, fy); x.imageSmoothingQuality = "high"; x.drawImage(ref, b.x, b.y, b.w, b.h, 0, 0, tw, th);
+    const g = grayRegion(c.getContext("2d"), 0, 0, tw, th);
+    return { tw, th, g: blur ? soft(g, tw, th) : g };
+  };
+  const scales = [];
+  for (let s = 0.25; s <= 2.01; s *= 1.22) if (b.w * f * s >= 14 && b.h * f * s >= 6 && b.w * f * s < sw * 0.6) scales.push(+s.toFixed(3));
+  const hits = []; let done = 0;
+  const total = frames.length * scales.length * flips.length;
+  for (const fr of frames) {
+    const g = grayOf(fr.canvas, sw, sh), gs = soft(g, sw, sh);
+    for (const s of scales) for (const [name, fx, fy] of flips) {
+      const t = makeTpl(s, fx, fy, true), st = t.tw * t.th > 600 ? 2 : 1, found = [];
+      for (let y = 0; y + t.th <= sh; y += 2) for (let x = 0; x + t.tw <= sw; x += 2) {
+        const v = nccAt(t.g, t.tw, t.th, gs, sw, x, y, st);
+        if (v >= 0.6) found.push({ x, y, v });
+      }
+      found.sort((p, q) => q.v - p.v);
+      for (const p of found.slice(0, 8)) {
+        // second pass, unsoftened: try nearby sizes and every pixel around the spot
+        let best = { v: -1 };
+        for (const s2 of [s * 0.9, s * 0.94, s * 0.97, s, s * 1.03, s * 1.06, s * 1.1]) {
+          const t2 = makeTpl(s2, fx, fy, false);
+          for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) {
+            const x = p.x + dx, y = p.y + dy; if (x < 0 || y < 0 || x + t2.tw > sw || y + t2.th > sh) continue;
+            const v = nccAt(t2.g, t2.tw, t2.th, g, sw, x, y, 1); if (v > best.v) best = { x, y, v, tw: t2.tw, th: t2.th, s: s2 };
+          }
+        }
+        if (best.v < 0.6) continue;
+        const box = { x: Math.round(best.x / f), y: Math.round(best.y / f), w: Math.round(best.tw / f), h: Math.round(best.th / f) };
+        const ov = Math.max(0, Math.min(box.x + box.w, b.x + b.w) - Math.max(box.x, b.x)) * Math.max(0, Math.min(box.y + box.h, b.y + b.h) - Math.max(box.y, b.y));
+        if (ov > 0.2 * Math.min(box.w * box.h, b.w * b.h)) continue;          // that's the plate itself
+        hits.push({ at: fr.at, frame: fr, box, match: +best.v.toFixed(3), view: name, scale: +best.s.toFixed(2), fx, fy });
+      }
+      onProgress(++done / total); if (done % 4 === 0) await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+  hits.sort((p, q) => q.match - p.match);
+  const keep = [];
+  for (const h1 of hits) {
+    if (keep.some((k) => k.at === h1.at && Math.abs(k.box.x - h1.box.x) < h1.box.w * 0.6 && Math.abs(k.box.y - h1.box.y) < h1.box.h * 0.6)) continue;
+    keep.push(h1); if (keep.length >= 6) break;
+  }
+  return keep.map((k, i) => {
+    const up = Math.max(1, Math.round(160 / k.box.w)), c = canvasOf(k.box.w * up, k.box.h * up), x = c.getContext("2d");
+    x.imageSmoothingEnabled = false;
+    x.translate(k.fx < 0 ? c.width : 0, k.fy < 0 ? c.height : 0); x.scale(k.fx, k.fy);       // turn it back to normal reading direction
+    x.drawImage(k.frame.canvas, k.box.x, k.box.y, k.box.w, k.box.h, 0, 0, c.width, c.height);
+    return { n: i + 1, at: k.at, box: k.box, match: k.match, view: k.view, size_vs_plate: k.scale, crop: c };
+  });
+}
+
 // ---------- step 4: read the plate ----------
 // Standard passenger layouts. Vanity, specialty, dealer and older plates differ: use "Custom" or "Any" for those.
 const FORMATS = {
@@ -979,6 +1060,22 @@ function readStep(stage) {
   const leadCard = h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Lead list (Texas Classic plates)"),
     h("p", { class: "small muted" }, "For footage too poor to read. PlateTrace copies the camera's damage (low resolution, blur, glare) onto every possible Texas plate and keeps the ones that could have produced this image, best fit first. It never rules a plate out unless the footage clearly contradicts it."),
     lGo, h("div", { class: "progress" }, lBar), lStatus, lOut);
+  const rStatus = h("p", { class: "small muted" }), rBar = h("i", {}), rOut = h("div", {});
+  const rGo = h("button", { class: "ghost", onclick: async () => {
+    rGo.disabled = true; rOut.replaceChildren(); rStatus.className = "small muted"; rStatus.textContent = "Searching the whole picture for another view of the plate…";
+    try {
+      const R = await reflectionSearch((f) => (rBar.style.width = `${Math.round(f * 100)}%`));
+      C.reflections = R;
+      logStep("reflection_search", { method: "normalized cross-correlation of the marked plate (as is, mirrored, upside down; 6 sizes) across whole frames", found: R.map((r) => ({ n: r.n, frame: r.at, box: r.box, match: r.match, view: r.view })) });
+      rStatus.textContent = R.length ? `Found ${R.length} place(s) that look like the plate. They're turned back to normal reading direction below. Check each by eye: it may be a reflection, or just another plate or sign.` : "No second view of the plate was found in these frames.";
+      rOut.replaceChildren(h("div", { class: "result-imgs" }, R.map((r) => h("figure", { style: "margin:0" }, r.crop,
+        h("figcaption", { class: "small muted" }, `#${r.n} · ${r.view} · ${Math.round(r.match * 100)}% match · ${typeof r.at === "number" ? r.at + " s" : r.at} · at ${r.box.x},${r.box.y}`)))));
+    } catch (e) { rStatus.className = "small error"; rStatus.textContent = "The reflection search couldn't run: " + (e.message || e); }
+    rGo.disabled = false;
+  } }, "Search for reflections");
+  const reflCard = h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Reflections"),
+    h("p", { class: "small muted" }, "Looks across the whole picture for another view of the same plate: mirrored in a window or shiny paint, upside down in a puddle, smaller or bigger. Any hit must be checked by eye."),
+    rGo, h("div", { class: "progress" }, rBar), rStatus, rOut);
   const matchCard = h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Match test (Texas Classic plates)"),
     h("p", { class: "small muted" }, "Compares the combined image against real Texas plate letters and numbers, blurred to match the footage. It doesn't guess: a spot shows ? unless one character clearly wins and keeps winning when the fit is re-run. For the white Texas Classic plate (ABC-1234 with the Texas outline) only."),
     mGo, h("div", { class: "progress" }, mBar), mStatus, mOut);
@@ -986,7 +1083,7 @@ function readStep(stage) {
     h("div", { class: "row" }, h("label", {}, "State / plate layout", fmt, custom), h("label", {}, "Known characters (? = unknown)", mask)),
     h("label", { class: "small", style: "display:flex;gap:8px;align-items:center;margin-top:6px" }, noIOQ, "This state doesn't issue the letters I, O or Q (many don't; check yours). Removes them from the guesses."),
     h("p", { class: "small muted" }, "Tip: type the characters you can see and put ? for the ones you can't (e.g. 7?K4?2). PlateTrace then lists every plate that fits, ranked."),
-    h("div", { style: "margin-top:10px" }, go), h("div", { class: "progress" }, bar), status, results, matchCard, leadCard, h("div", { style: "margin-top:12px" }, next));
+    h("div", { style: "margin-top:10px" }, go), h("div", { class: "progress" }, bar), status, results, matchCard, leadCard, reflCard, h("div", { style: "margin-top:12px" }, next));
 }
 
 // ---------- step 5: vehicle details (the rest of the "fingerprint") ----------
@@ -1472,6 +1569,7 @@ function packageStep(stage) {
     const add = async (name, canvas, pdfTitle, maxH) => { const blob = await blobOf(canvas); const buf = await blob.arrayBuffer(); manifest.push({ file: name, sha256: await sha256(buf) }); zip.file(name, buf); if (pdfTitle) pics.push([`${pdfTitle} (${name})`, buf, maxH]); };
     await add("combined_enhanced.png", canvasFromData(C.combined), "Combined and enhanced plate", 180);
     await add("combined_raw.png", canvasFromData(C.combinedRaw), "Combined plate, no sharpening", 180);
+    for (const r of C.reflections || []) await add(`reflections/reflection_${r.n}.png`, r.crop, `Possible reflection #${r.n} (${r.view}, ${Math.round(r.match * 100)}% match, frame ${r.at}) - must be confirmed by eye`, 120);
     if (C.smart) await add("coverage_map.png", canvasFromData(C.smart.map), "Coverage map (green = recorded well in more frames, red = no frame recorded it well)", 120);
     await add("clearest_single_frame.png", canvasFromData(C.bestEnh), "Clearest single frame, same enhancement", 180);
     const used = C.frames.filter((f) => f.use);
@@ -1498,6 +1596,7 @@ function packageStep(stage) {
       frames: used.map((f, i) => ({ n: i + 1, at: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp, weight: f.weight ?? 1 })),
       processing: { ...C.params, alignment: "normalized cross-correlation with sub-pixel parabola fit", combining: "mean of aligned frames" },
       read_settings: C.readSettings, reads: C.reads, candidates: C.candidates, match_test: C.match || null,
+      reflections: (C.reflections || []).map((r) => ({ n: r.n, frame: r.at, box: r.box, match: r.match, view: r.view, size_vs_plate: r.size_vs_plate, image: `reflections/reflection_${r.n}.png` })),
       lead_list: C.leads ? { ...C.leads, list: C.leads.list.slice(0, 200), full_list_file: "lead_list.csv" } : null,
       partial_list: C.partial ? { ...C.partial, list: C.partial.list?.slice(0, 200) || [], full_list_file: C.partial.error ? null : "partial_plate_list.csv" } : null,
       vehicle: C.vehicle ? { rear_box: C.vehicle.box, frames_combined: C.vehicle.frames, paint_finish: C.vehicle.finish || null,
