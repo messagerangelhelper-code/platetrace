@@ -790,7 +790,7 @@ function readStep(stage) {
   const status = h("p", { class: "small muted" });
   const bar = h("i", {});
   const results = h("div", {});
-  const next = h("button", { disabled: true, onclick: () => vehicleStep(stage) }, "Next: vehicle details");
+  const next = h("button", { disabled: true, onclick: () => vehicleStep(stage) }, "Next: same vehicle — paint & Print & Pattern ▶");
   const run = async () => {
     go.disabled = true; results.replaceChildren();
     try {
