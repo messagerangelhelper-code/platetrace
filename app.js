@@ -537,12 +537,22 @@ function combineStep(stage) {
 }
 
 // ---------- step 4: read the plate ----------
+// Standard passenger layouts. Vanity, specialty, dealer and older plates differ: use "Custom" or "Any" for those.
 const FORMATS = {
-  any: { label: "Any state / unknown", re: null, pattern: "" },
-  tx: { label: "Texas passenger (ABC1234)", re: /^[A-Z]{3}[0-9]{4}$/, pattern: "LLLNNNN" },
-  ca: { label: "California passenger (1ABC234)", re: /^[0-9][A-Z]{3}[0-9]{3}$/, pattern: "NLLLNNN" },
-  custom: { label: "Custom pattern (L = letter, N = number)", re: null, pattern: "" },
+  any: { label: "Any state / unknown", pattern: [] },
+  tx: { label: "Texas passenger (ABC1234)", pattern: ["LLLNNNN"] },
+  ca: { label: "California passenger (1ABC234)", pattern: ["NLLLNNN"] },
+  l3n4: { label: "ABC1234: AZ, GA, MI, NY, NC, OH, PA, VA, WA and others", pattern: ["LLLNNNN"] },
+  md: { label: "1AB2345: Maryland", pattern: ["NLLNNNN"] },
+  il: { label: "AB12345: Illinois", pattern: ["LLNNNNN"] },
+  nj: { label: "A12BCD: New Jersey", pattern: ["LNNLLL"] },
+  l3n3: { label: "ABC123: many states", pattern: ["LLLNNN"] },
+  n3l3: { label: "123ABC: many older plates", pattern: ["NNNLLL"] },
+  common: { label: "Try all of the layouts above", pattern: ["LLLNNNN", "NLLLNNN", "NLLNNNN", "LLNNNNN", "LNNLLL", "LLLNNN", "NNNLLL"] },
+  custom: { label: "Custom pattern (L = letter, N = number)", pattern: [] },
 };
+const patternsFor = (fmt, custom) => fmt === "custom" ? [String(custom || "").toUpperCase().replace(/[^LN]/g, "")].filter(Boolean) : FORMATS[fmt].pattern;
+const NO_IOQ = /[IOQ]/;
 const TO_DIGIT = { O: "0", D: "0", Q: "0", I: "1", L: "1", Z: "2", S: "5", G: "6", B: "8", T: "7", A: "4" };
 const TO_LETTER = { 0: "O", 1: "I", 2: "Z", 5: "S", 6: "G", 8: "B", 7: "T", 4: "A" };
 
@@ -595,11 +605,11 @@ function buildCandidates(reads, maskStr) {
   return out;
 }
 
-function fitFormat(cands, fmt, customPattern) {
-  const pattern = fmt === "custom" ? customPattern.toUpperCase().replace(/[^LN]/g, "") : FORMATS[fmt].pattern;
-  if (!pattern) return cands.map((c) => ({ ...c, note: "" }));
+function fitFormat(cands, fmt, customPattern, noIOQ) {
+  const pats = patternsFor(fmt, customPattern);
+  if (!pats.length) return cands.filter((c) => !noIOQ || !NO_IOQ.test(c.plate)).map((c) => ({ ...c, note: "" }));
   const res = [];
-  for (const c of cands) {
+  for (const c of cands) for (const pattern of pats) {
     if (c.plate.length !== pattern.length) continue;
     let s = "", changed = 0, ok = true;
     [...c.plate].forEach((ch, i) => {
@@ -608,9 +618,71 @@ function fitFormat(cands, fmt, customPattern) {
       else if (want === "N" && /[A-Z]/.test(ch)) { if (TO_DIGIT[ch]) { s += TO_DIGIT[ch]; changed++; } else ok = false; }
       else s += ch;
     });
-    if (ok) res.push({ ...c, plate: s, agreement: c.agreement * Math.pow(0.85, changed), note: changed ? `adjusted ${changed} look-alike character${changed > 1 ? "s" : ""} to fit format` : "fits format" });
+    if (ok && noIOQ && [...s].some((ch, i) => pattern[i] === "L" && NO_IOQ.test(ch))) ok = false;
+    if (ok) res.push({ ...c, plate: s, agreement: c.agreement * Math.pow(0.85, changed), note: (changed ? `adjusted ${changed} look-alike character${changed > 1 ? "s" : ""} to fit` : "fits") + (pats.length > 1 ? ` ${pattern}` : " format") });
   }
   return res;
+}
+
+// ---------- partial-plate search list ----------
+// Every plate that fits the known characters and the layout, ranked by how often the reader saw each character in each spot.
+const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ", DIGITS = "0123456789";
+function partialList(maskStr, fmt, customPattern, noIOQ, reads) {
+  const mask = maskStr.toUpperCase().replace(/[^A-Z0-9?]/g, "");
+  if (!mask.includes("?")) return null;
+  const L = mask.length;
+  let pats = patternsFor(fmt, customPattern).filter((p) => p.length === L);
+  if (!patternsFor(fmt, customPattern).length) pats = [""];
+  if (!pats.length) return { mask, total: 0, list: [], error: `None of the chosen layouts has ${L} characters. Check the known characters or pick another layout.` };
+  const group = reads.filter((r) => r.text.length === L);
+  const out = new Map(); let total = 0, ranked = true;
+  for (const pat of pats) {
+    let okMask = true;
+    const opts = [...mask].map((ch, i) => {
+      const want = pat[i] || "";
+      let pool = want === "L" ? LETTERS : want === "N" ? DIGITS : LETTERS + DIGITS;
+      if (noIOQ && want === "L") pool = pool.replace(/[IOQ]/g, "");
+      if (ch !== "?") { if (!pool.includes(ch)) okMask = false; return [[ch, 1]]; }
+      const votes = {}; let sum = 0;
+      group.forEach((r) => {
+        let c = r.text[i];
+        if (want === "L" && DIGITS.includes(c)) c = TO_LETTER[c] || c;
+        if (want === "N" && LETTERS.includes(c)) c = TO_DIGIT[c] || c;
+        const w = 0.2 + r.conf / 100; if (pool.includes(c)) { votes[c] = (votes[c] || 0) + w; sum += w; }
+      });
+      return [...pool].map((c) => [c, ((votes[c] || 0) + 0.05) / (sum + 0.05 * pool.length)]).sort((a, b) => b[1] - a[1]);
+    });
+    if (!okMask) continue;
+    const count = opts.reduce((n, o) => n * o.length, 1); total += count;
+    const keep = count <= 200000 ? Infinity : 20000; if (keep !== Infinity) ranked = false;
+    let beam = [["", 1]];
+    opts.forEach((o) => { beam = beam.flatMap(([s, p]) => o.map(([c, q]) => [s + c, p * q])); if (beam.length > keep) beam = beam.sort((a, b) => b[1] - a[1]).slice(0, keep); });
+    beam.forEach(([s, p]) => { if (!out.has(s) || out.get(s) < p) out.set(s, p); });
+  }
+  const list = [...out.entries()].sort((a, b) => b[1] - a[1]).map(([plate, p]) => ({ plate, score: p }));
+  const top = list[0]?.score || 1;
+  return { mask, layouts: pats.filter(Boolean), total, complete: ranked, read_versions_used: group.length,
+    list: list.slice(0, 20000).map((x) => ({ plate: x.plate, rank_score: Math.round((x.score / top) * 1000) / 10 })) };
+}
+function partialCsv(pl) {
+  return "rank,plate,relative_score\n" + pl.list.map((x, i) => `${i + 1},${x.plate},${x.rank_score}`).join("\n") + "\n";
+}
+function downloadText(name, text, type) {
+  const a = h("a", { href: URL.createObjectURL(new Blob([text], { type })), download: name });
+  document.body.append(a); a.click(); a.remove();
+}
+function partialView(pl) {
+  if (!pl) return null;
+  if (pl.error) return h("p", { class: "error" }, pl.error);
+  return h("div", { class: "card", style: "margin-top:12px" },
+    h("h3", {}, "Partial-plate search list"),
+    h("p", { class: "small muted" }, `${pl.total.toLocaleString()} possible plates fit "${pl.mask}"${pl.layouts.length ? " in layout " + pl.layouts.join(" / ") : ""}. ` +
+      (pl.read_versions_used ? `Ranked by what the reader saw in each unknown spot (${pl.read_versions_used} reads of this length).` : "No reads had this length, so the order is alphabetical-equal; add more known characters to shrink the list.") +
+      (pl.complete ? "" : ` Too many to list them all, so the top ${pl.list.length.toLocaleString()} are kept; add another known character to get the full list.`)),
+    h("p", { class: "small" }, "Run this list against your agency's plate-camera and records systems with the time, place and vehicle description. Every entry is a lead, not an identification."),
+    h("div", { class: "chips" }, pl.list.slice(0, 40).map((x, i) => h("span", { class: "chip plate", title: `relative score ${x.rank_score}` }, `${i + 1}. ${x.plate}`))),
+    h("button", { class: "ghost", style: "margin-top:8px", onclick: () => { downloadText(`PlateTrace_${C.caseNo.replace(/[^\w-]+/g, "_")}_partial_${pl.mask.replace(/\?/g, "x")}.csv`, partialCsv(pl), "text/csv"); audit("partial_list_download", { mask: pl.mask, rows: pl.list.length }); } },
+      `Download the full list (${pl.list.length.toLocaleString()} rows, .csv)`));
 }
 
 function readStep(stage) {
@@ -618,6 +690,7 @@ function readStep(stage) {
   const custom = h("input", { placeholder: "e.g. LLLNNNN", style: "display:none" });
   fmt.addEventListener("change", () => (custom.style.display = fmt.value === "custom" ? "" : "none"));
   const mask = h("input", { placeholder: "e.g. 7?K4?2 (optional)" });
+  const noIOQ = h("input", { type: "checkbox" });
   const status = h("p", { class: "small muted" });
   const bar = h("i", {});
   const results = h("div", {});
@@ -645,13 +718,15 @@ function readStep(stage) {
         reads.push({ source: variants[i][0], text, conf: Math.round(data.confidence || 0) });
         bar.style.width = `${Math.round(((i + 1) / variants.length) * 100)}%`;
       }
-      let cands = fitFormat(buildCandidates(reads, mask.value), fmt.value, custom.value);
+      let cands = fitFormat(buildCandidates(reads, mask.value), fmt.value, custom.value, noIOQ.checked);
       const m = mask.value.toUpperCase().replace(/[^A-Z0-9?]/g, "");
       if (m) cands = cands.filter((c) => c.plate.length === m.length && [...m].every((ch, i) => ch === "?" || ch === c.plate[i]));
       const seen = new Set();
       cands = cands.sort((a, b) => b.agreement - a.agreement).filter((c) => !seen.has(c.plate) && seen.add(c.plate)).slice(0, 10);
       C.reads = reads; C.candidates = cands.map((c) => ({ ...c, agreement: Math.round(c.agreement * 100) }));
-      C.readSettings = { format: FORMATS[fmt.value].label, custom_pattern: custom.value || null, mask: m || null };
+      C.readSettings = { format: FORMATS[fmt.value].label, layouts: patternsFor(fmt.value, custom.value), custom_pattern: custom.value || null, mask: m || null, no_I_O_Q: noIOQ.checked };
+      C.partial = partialList(m, fmt.value, custom.value, noIOQ.checked, reads);
+      if (C.partial && !C.partial.error) logStep("partial_list", { mask: C.partial.mask, possible: C.partial.total, kept: C.partial.list.length, top: C.partial.list.slice(0, 3).map((x) => x.plate) });
       logStep("plate_read", { versions_read: reads.length, ...C.readSettings, top: C.candidates.slice(0, 3).map((c) => `${c.plate} (${c.agreement}%)`) });
       status.textContent = `Read ${reads.length} versions of the plate.`;
       results.replaceChildren(
@@ -663,7 +738,8 @@ function readStep(stage) {
             h("td", { class: "small muted" }, [c.note, `${c.length_reads} of ${reads.length} reads had this length`].filter(Boolean).join(" · ")))))
           : h("p", { class: "error" }, "No candidates matched. Try 'Any state', remove the known-characters mask, or mark the plate more tightly. If the plate is only a few blurry pixels, the detail may simply not be in the footage."),
         h("details", { style: "margin-top:10px" }, h("summary", { class: "small" }, "All reads (for transparency)"),
-          h("table", {}, reads.map((r) => h("tr", {}, h("td", { class: "small muted" }, r.source), h("td", { class: "plate", style: "font-size:14px" }, r.text || "—"), h("td", { class: "small muted" }, `${r.conf}%`))))));
+          h("table", {}, reads.map((r) => h("tr", {}, h("td", { class: "small muted" }, r.source), h("td", { class: "plate", style: "font-size:14px" }, r.text || "—"), h("td", { class: "small muted" }, `${r.conf}%`))))),
+        partialView(C.partial) || "");
       next.disabled = false;
     } catch (e) {
       status.className = "small error"; status.textContent = "The plate reader couldn't run: " + (e.message || e);
@@ -672,7 +748,9 @@ function readStep(stage) {
   };
   const go = h("button", { onclick: run }, "Read the plate");
   stage.replaceChildren(stepsBar(4), h("h2", {}, "Read the plate"),
-    h("div", { class: "row" }, h("label", {}, "Plate format", fmt, custom), h("label", {}, "Known characters (? = unknown)", mask)),
+    h("div", { class: "row" }, h("label", {}, "State / plate layout", fmt, custom), h("label", {}, "Known characters (? = unknown)", mask)),
+    h("label", { class: "small", style: "display:flex;gap:8px;align-items:center;margin-top:6px" }, noIOQ, "This state doesn't issue the letters I, O or Q (many don't; check yours). Removes them from the guesses."),
+    h("p", { class: "small muted" }, "Tip: type the characters you can see and put ? for the ones you can't (e.g. 7?K4?2). PlateTrace then lists every plate that fits, ranked."),
     h("div", { style: "margin-top:10px" }, go), h("div", { class: "progress" }, bar), status, results, h("div", { style: "margin-top:12px" }, next));
 }
 
@@ -1004,6 +1082,133 @@ async function vehicleStep(stage) {
   if (C.vehicle.combined) showDetails();
 }
 
+// ---------- court-ready report (PDF) ----------
+const pdfSafe = (t) => String(t ?? "").replace(/[\u2192]/g, "->").replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/\u2026/g, "...")
+  .replace(/[^\x20-\x7E\u00A0-\u00FF\u2013\u2014\u2022]/g, "?");
+async function buildReportPdf(report, images) {
+  const { PDFDocument, StandardFonts, rgb } = PDFLib;
+  const doc = await PDFDocument.create();
+  doc.setTitle(`PlateTrace examination report, case ${report.case_no}`); doc.setAuthor(pdfSafe(report.examiner)); doc.setCreator(VERSION);
+  const font = await doc.embedFont(StandardFonts.Helvetica), bold = await doc.embedFont(StandardFonts.HelveticaBold), mono = await doc.embedFont(StandardFonts.Courier);
+  const W = 612, H = 792, M = 54, TW = W - 2 * M;
+  let page, y;
+  const newPage = () => { page = doc.addPage([W, H]); y = H - M; };
+  const need = (hgt) => { if (y - hgt < M + 20) newPage(); };
+  const wrap = (text, f, size, width) => {
+    const out = [];
+    pdfSafe(text).split("\n").forEach((para) => {
+      let line = "";
+      para.split(/(\s+)/).forEach((w) => {
+        const t = line + w;
+        if (f.widthOfTextAtSize(t, size) > width && line.trim()) { out.push(line.trimEnd()); line = w.trimStart(); }
+        else line = t;
+        while (f.widthOfTextAtSize(line, size) > width) { let k = line.length - 1; while (k > 1 && f.widthOfTextAtSize(line.slice(0, k), size) > width) k--; out.push(line.slice(0, k)); line = line.slice(k); }
+      });
+      out.push(line.trimEnd());
+    });
+    return out;
+  };
+  const text = (t, { f = font, size = 10, color = rgb(0.1, 0.1, 0.12), indent = 0, gap = 3 } = {}) => {
+    for (const ln of wrap(t, f, size, TW - indent)) { need(size + gap); page.drawText(ln, { x: M + indent, y: y - size, size, font: f, color }); y -= size + gap; }
+  };
+  const heading = (t) => { need(80); y -= 10; page.drawText(pdfSafe(t), { x: M, y: y - 13, size: 13, font: bold, color: rgb(0.05, 0.2, 0.45) }); y -= 18;
+    page.drawLine({ start: { x: M, y }, end: { x: W - M, y }, thickness: 0.6, color: rgb(0.7, 0.75, 0.82) }); y -= 8; };
+  const kv = (k, v) => { need(14); page.drawText(pdfSafe(k), { x: M, y: y - 10, size: 10, font: bold }); const lines = wrap(v, font, 10, TW - 140);
+    lines.forEach((ln, i) => { if (i) need(13); page.drawText(ln, { x: M + 140, y: y - 10, size: 10, font }); y -= 13; }); };
+  const table = (cols, rows, widths, size = 9) => {
+    const row = (cells, f) => {
+      const wrapped = cells.map((c, i) => wrap(c, f === bold ? bold : (cols[i].mono ? mono : font), size, widths[i] - 6));
+      const hgt = Math.max(...wrapped.map((w) => w.length)) * (size + 2) + 4; need(hgt);
+      let x = M; wrapped.forEach((w, i) => { w.forEach((ln, j) => page.drawText(ln, { x: x + 3, y: y - size - 2 - j * (size + 2), size, font: f === bold ? bold : (cols[i].mono ? mono : font) })); x += widths[i]; });
+      y -= hgt; page.drawLine({ start: { x: M, y }, end: { x: M + widths.reduce((a, b) => a + b, 0), y }, thickness: 0.3, color: rgb(0.8, 0.8, 0.85) });
+    };
+    row(cols.map((c) => c.label), bold); rows.forEach((r) => row(r.map(String), font));
+  };
+  const image = async (title, bytes, maxH = 260) => {
+    const img = await doc.embedPng(bytes); const sc = Math.min(TW / img.width, maxH / img.height, 3);
+    const w = img.width * sc, hgt = img.height * sc; need(hgt + 30);
+    page.drawText(pdfSafe(title), { x: M, y: y - 10, size: 10, font: bold }); y -= 16;
+    page.drawImage(img, { x: M, y: y - hgt, width: w, height: hgt }); page.drawRectangle({ x: M, y: y - hgt, width: w, height: hgt, borderWidth: 0.5, borderColor: rgb(0.5, 0.5, 0.55) }); y -= hgt + 12;
+  };
+
+  newPage();
+  page.drawText("PlateTrace Examination Report", { x: M, y: y - 20, size: 20, font: bold, color: rgb(0.05, 0.2, 0.45) }); y -= 30;
+  text("Video and image enhancement and candidate plate reading. Investigative leads only; not an identification.", { size: 10, color: rgb(0.35, 0.35, 0.4) }); y -= 6;
+  kv("Case number", report.case_no); kv("Examiner", report.examiner); kv("Signed-in account", report.user); kv("Agency", report.agency || "-");
+  kv("Report generated", report.generated_at); kv("Tool and version", report.tool);
+
+  heading("1. Summary");
+  const used = report.frames.length, top = report.candidates.slice(0, 3);
+  text(`${report.originals.length} original file(s) were examined. ${used} frame(s) showing the license plate were lined up with each other and averaged into one combined image, which was then sharpened. ` +
+    `The plate reader read ${report.reads.length} versions of the plate (combined and single frames, normal and black/white) and the reads were combined character by character.` +
+    (top.length ? ` The leading candidates are ${top.map((c) => `${c.plate} (${c.agreement}% agreement)`).join(", ")}.` : " No candidate fit the chosen plate layout.") +
+    (report.partial_list && !report.partial_list.error ? ` A partial-plate search list for "${report.partial_list.mask}" contains ${report.partial_list.total.toLocaleString()} possible plates; the top entries are listed in section 5.` : "") +
+    (report.vehicle ? " The back of the vehicle was also combined and its paint and distinguishing marks were documented (section 6)." : ""));
+
+  heading("2. Original evidence");
+  text("Each original file was fingerprinted with SHA-256 before any processing. The originals were never changed or uploaded; all processing ran on the examiner's own device.", { size: 9 });
+  table([{ label: "File" }, { label: "Size (bytes)" }, { label: "SHA-256", mono: true }], report.originals.map((o) => [o.name, o.bytes.toLocaleString(), o.sha256]), [150, 70, TW - 220], 8);
+
+  heading("3. Method (plain English)");
+  [
+    `Marking: the examiner drew a box around the plate${report.reference_time_s != null ? ` at ${Number(report.reference_time_s).toFixed(2)} s into the video` : ""}.`,
+    "Finding frames: nearby frames were searched for the same plate using normalized cross-correlation (a standard pattern-matching measure). Each frame's sharpness was scored, and blurry or poorly matching frames were left out.",
+    "Lining up: each kept frame was shifted, to a fraction of a pixel, so the plate sits in the same place in every frame. The shifts are listed in the case report.",
+    `Combining: the lined-up frames were enlarged ${report.processing.upscale || UP}x and averaged. Averaging reduces random noise; it cannot create detail that was not recorded.`,
+    `Enhancing: contrast stretch and unsharp-mask sharpening (amount ${report.processing.sharpen_amount ?? "-"}) were applied. These are standard, reversible adjustments.`,
+    `Reading: open-source optical character recognition (Tesseract) read each version. Characters were combined by weighted vote at each position${report.read_settings?.layouts?.length ? `, then fitted to the layout ${report.read_settings.layouts.join(" / ")}` : ""}; look-alike characters (for example 0/O, 8/B) were only swapped where the layout requires it, and every swap is noted.`,
+    "No generative AI was used. No pixels were invented, painted in or predicted; every output comes only from the recorded pixels.",
+  ].forEach((t) => text("\u2022 " + t, { size: 9.5, indent: 6 }));
+
+  heading("4. Images");
+  for (const [title, bytes, mh] of images) await image(title, bytes, mh);
+
+  heading("5. Plate candidates");
+  text(`Layout: ${report.read_settings?.format || "-"}. Known characters: ${report.read_settings?.mask || "none"}.${report.read_settings?.no_I_O_Q ? " Letters I, O and Q excluded." : ""}`, { size: 9 });
+  if (report.candidates.length) table([{ label: "#" }, { label: "Candidate", mono: true }, { label: "Agreement" }, { label: "Notes" }],
+    report.candidates.map((c, i) => [i + 1, c.plate, c.agreement + "%", c.note || ""]), [24, 100, 66, TW - 190]);
+  else text("No candidate fit the chosen layout.", { size: 9.5 });
+  if (report.partial_list && !report.partial_list.error) {
+    y -= 6; text(`Partial-plate search list for "${report.partial_list.mask}": ${report.partial_list.total.toLocaleString()} possible plates${report.partial_list.complete ? "" : " (top " + report.partial_list.list.length.toLocaleString() + " kept)"}. Top 30 shown; the full list is in partial_plate_list.csv.`, { size: 9 });
+    const pl = report.partial_list.list.slice(0, 30);
+    table([{ label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }, { label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }],
+      Array.from({ length: Math.ceil(pl.length / 2) }, (_, i) => [i + 1, pl[i].plate, pl[i].rank_score, pl[i + 15] ? i + 16 : "", pl[i + 15]?.plate || "", pl[i + 15]?.rank_score ?? ""]), [40, 90, 54, 40, 90, 54]);
+  }
+  y -= 6; text("All reads (for transparency):", { size: 9, f: bold });
+  table([{ label: "Version read" }, { label: "Text", mono: true }, { label: "Reader confidence" }], report.reads.map((r) => [r.source, r.text || "-", r.conf + "%"]), [220, 140, TW - 360], 8.5);
+
+  if (report.vehicle) {
+    const v = report.vehicle;
+    heading("6. Vehicle details");
+    kv("Rear frames combined", String(v.frames_combined ?? "-")); kv("Paint finish noted", v.paint_finish || "not noted");
+    if (v.paint_samples?.length) table([{ label: "Sample" }, { label: "Color (corrected)" }, { label: "As recorded" }, { label: "Surface" }, { label: "vs A" }],
+      v.paint_samples.map((s) => [s.label, `${s.corrected.name} ${s.corrected.hex}`, s.as_recorded.hex, s.surface?.label || "-", s.difference_from_A != null ? `${s.difference_from_A}${s.possible_panel_mismatch ? " possible mismatched panel" : ""}` : "-"]), [46, 140, 76, 90, TW - 352], 8.5);
+    if (v.marks?.length) { y -= 4; text("Distinguishing marks:", { size: 9, f: bold }); v.marks.forEach((m) => text(`${m.n}. ${m.type}${m.note ? ": " + m.note : ""}`, { size: 9, indent: 8 })); }
+    if (v.print_pattern?.areas?.length) { y -= 4; text("Print & Pattern scan areas (lighting-corrected color difference from the main body color):", { size: 9, f: bold });
+      table([{ label: "Area" }, { label: "Label" }, { label: "Color" }, { label: "Difference" }, { label: "% of rear" }], v.print_pattern.areas.map((a) => [a.n, a.label, `${a.color.name} ${a.color.hex}`, a.difference, a.size_pct]), [40, 150, 130, 70, TW - 390], 8.5); }
+  }
+
+  heading(`${report.vehicle ? 7 : 6}. Step-by-step record`);
+  table([{ label: "Time (UTC)" }, { label: "Step" }, { label: "Details", mono: true }], report.log.map(({ time, step, ...rest }) => [time.replace("T", " ").replace("Z", ""), step, JSON.stringify(rest)]), [110, 90, TW - 200], 7);
+
+  heading(`${report.vehicle ? 8 : 7}. Output files and fingerprints`);
+  table([{ label: "File" }, { label: "SHA-256", mono: true }], report.outputs.map((o) => [o.file, o.sha256]), [190, TW - 190], 7.5);
+
+  heading(`${report.vehicle ? 9 : 8}. Limitations`);
+  ["Candidates are investigative leads, not an identification. Confirm any candidate against the original footage and agency records before acting on it.",
+   "Agreement percentages show how consistently the reads agreed; they are not a statistical probability that the plate is correct.",
+   "Results depend on the recorded detail. If the plate is only a few pixels wide, the true characters may not be recoverable.",
+   "For court use, have a certified forensic video analyst review the original footage and this report.",
+  ].forEach((t) => text("\u2022 " + t, { size: 9.5, indent: 6 }));
+  need(110); y -= 30;
+  const sig = (label, x) => { page.drawLine({ start: { x, y }, end: { x: x + 220, y }, thickness: 0.6 }); page.drawText(label, { x, y: y - 12, size: 8.5, font }); };
+  sig("Examiner signature / date", M); sig("Reviewed by (forensic video analyst) / date", M + 270);
+
+  const pages = doc.getPages();
+  pages.forEach((pg, i) => pg.drawText(pdfSafe(`PlateTrace  |  Case ${report.case_no}  |  Page ${i + 1} of ${pages.length}`), { x: M, y: 28, size: 8, font, color: rgb(0.45, 0.45, 0.5) }));
+  return doc.save();
+}
+
 // ---------- step 6: case package ----------
 function packageStep(stage) {
   const status = h("p", { class: "small muted" });
@@ -1011,24 +1216,26 @@ function packageStep(stage) {
     go.disabled = true; status.textContent = "Building the case package…";
     const zip = new JSZip();
     const manifest = [];
-    const add = async (name, canvas) => { const blob = await blobOf(canvas); const buf = await blob.arrayBuffer(); manifest.push({ file: name, sha256: await sha256(buf) }); zip.file(name, buf); };
-    await add("combined_enhanced.png", canvasFromData(C.combined));
-    await add("combined_raw.png", canvasFromData(C.combinedRaw));
-    await add("clearest_single_frame.png", canvasFromData(C.bestEnh));
+    const pics = [];
+    const add = async (name, canvas, pdfTitle, maxH) => { const blob = await blobOf(canvas); const buf = await blob.arrayBuffer(); manifest.push({ file: name, sha256: await sha256(buf) }); zip.file(name, buf); if (pdfTitle) pics.push([`${pdfTitle} (${name})`, buf, maxH]); };
+    await add("combined_enhanced.png", canvasFromData(C.combined), "Combined and enhanced plate", 180);
+    await add("combined_raw.png", canvasFromData(C.combinedRaw), "Combined plate, no sharpening", 180);
+    await add("clearest_single_frame.png", canvasFromData(C.bestEnh), "Clearest single frame, same enhancement", 180);
     const used = C.frames.filter((f) => f.use);
     for (let i = 0; i < used.length; i++) await add(`frames/frame_${String(i + 1).padStart(2, "0")}.png`, canvasFromData(used[i].img));
     if (C.vehicle?.combined) {
       await add("vehicle_rear_combined.png", canvasFromData(C.vehicle.combined));
-      await add("vehicle_rear_marked.png", markedRear());
+      await add("vehicle_rear_marked.png", markedRear(), "Back of the vehicle with paint samples and numbered marks", 300);
       if (C.vehicle.scan) {
         const sc = C.vehicle.scan;
-        await add("print_pattern/color_difference_map.png", outlinedDiff(sc));
+        await add("print_pattern/color_difference_map.png", outlinedDiff(sc), "Print & Pattern: color difference map", 260);
         await add("print_pattern/detail_map.png", canvasFromData(sc.detail));
         await add("print_pattern/paint_print.png", sc.printC);
         for (const a of sc.areas) await add(`print_pattern/area_${String(a.n).padStart(2, "0")}.png`, a.crop);
       }
     }
-    logStep("package_built", { files: manifest.length });
+    if (C.partial && !C.partial.error) { const buf = new TextEncoder().encode(partialCsv(C.partial)); manifest.push({ file: "partial_plate_list.csv", sha256: await sha256(buf) }); zip.file("partial_plate_list.csv", buf); }
+    logStep("package_built", { files: manifest.length + 1 });
     const report = {
       tool: VERSION, generated_at: nowIso(), case_no: C.caseNo, examiner: C.examiner, user: S.user.email,
       agency: S.access?.agency || (S.isAdmin ? "PlateTrace admin" : null),
@@ -1037,6 +1244,7 @@ function packageStep(stage) {
       frames: used.map((f, i) => ({ n: i + 1, at: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp })),
       processing: { ...C.params, alignment: "normalized cross-correlation with sub-pixel parabola fit", combining: "mean of aligned frames" },
       read_settings: C.readSettings, reads: C.reads, candidates: C.candidates,
+      partial_list: C.partial ? { ...C.partial, list: C.partial.list?.slice(0, 200) || [], full_list_file: C.partial.error ? null : "partial_plate_list.csv" } : null,
       vehicle: C.vehicle ? { rear_box: C.vehicle.box, frames_combined: C.vehicle.frames, paint_finish: C.vehicle.finish || null,
         paint_samples: (C.vehicle.samples || []).map((sm) => ({ label: sm.label, box: sm.box, as_recorded: sm.raw, corrected: sm.corrected, surface: sm.evenness, difference_from_A: sm.delta, possible_panel_mismatch: sm.flag })),
         white_reference_from_plate: C.vehicle.samples?.[0]?.white_reference_from_plate || null, marks: C.vehicle.marks,
@@ -1046,10 +1254,21 @@ function packageStep(stage) {
       outputs: manifest, log: C.log,
       notice: "Candidates are investigative leads, not identification. Verify against the original footage and agency records. Enhancement only rescales and averages recorded pixels; no generative AI was used.",
     };
+    let pdfBytes = null;
+    try {
+      status.textContent = "Writing the court report (PDF)…";
+      const pdfReport = { ...report, partial_list: C.partial || null };
+      pdfBytes = await buildReportPdf(pdfReport, pics);
+      zip.file("PlateTrace_report.pdf", pdfBytes);
+      report.report_pdf = { file: "PlateTrace_report.pdf", sha256: await sha256(pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength)) };
+      lastPdf = pdfBytes;
+    } catch (e) { report.report_pdf = { error: String(e.message || e) }; }
     zip.file("case_report.json", JSON.stringify(report, null, 2));
     zip.file("README.txt", [
       `PlateTrace case package — case ${C.caseNo}`, `Generated ${report.generated_at} by ${C.examiner} (${S.user.email})`, "",
+      "PlateTrace_report.pdf  court-ready report: summary, method in plain English, images, candidates, full step record, fingerprints, signature lines",
       "case_report.json  every step, setting, frame shift, read and candidate, plus SHA-256 fingerprints",
+      ...(C.partial && !C.partial.error ? [`partial_plate_list.csv  every plate fitting "${C.partial.mask}", ranked (${C.partial.list.length} rows)`] : []),
       "combined_enhanced.png / combined_raw.png  the lined-up frames averaged together",
       "clearest_single_frame.png  the sharpest single frame, same enhancement",
       "frames/  each lined-up frame used",
@@ -1066,13 +1285,19 @@ function packageStep(stage) {
     const a = h("a", { href: URL.createObjectURL(blob), download: `PlateTrace_${C.caseNo.replace(/[^\w-]+/g, "_")}_${nowIso().slice(0, 10)}.zip` });
     document.body.append(a); a.click(); a.remove();
     await audit("export", { frames: used.length, top: C.candidates.slice(0, 3).map((c) => c.plate) });
-    status.className = "small ok"; status.textContent = "Case package downloaded. This export was recorded in the audit log.";
-    go.disabled = false;
+    status.className = "small ok"; status.textContent = "Case package downloaded (includes the PDF report). This export was recorded in the audit log.";
+    if (!pdfBytes) { status.className = "small error"; status.textContent = "Case package downloaded, but the PDF report couldn't be made: " + report.report_pdf.error; }
+    go.disabled = false; pdfBtn.disabled = !pdfBytes;
   };
+  let lastPdf = null;
+  const pdfBtn = h("button", { class: "ghost", disabled: true, style: "margin-left:8px", onclick: () => {
+    const a = h("a", { href: URL.createObjectURL(new Blob([lastPdf], { type: "application/pdf" })), download: `PlateTrace_${C.caseNo.replace(/[^\w-]+/g, "_")}_report.pdf` });
+    document.body.append(a); a.click(); a.remove(); audit("report_pdf_download", {});
+  } }, "Download the PDF report alone");
   const go = h("button", { onclick: build }, "Download case package (.zip)");
   stage.replaceChildren(stepsBar(6), h("h2", {}, "Case package"),
-    h("p", { class: "small muted" }, "One zip with the enhanced images, every frame used, the candidate list and a full report with SHA-256 fingerprints, ready to hand to your forensic video unit or to load into Amped FIVE or iNPUT-ACE."),
-    go, status,
+    h("p", { class: "small muted" }, "One zip with the court-ready PDF report, the enhanced images, every frame used, the candidate list and a full record with SHA-256 fingerprints, ready to hand to your forensic video unit or to load into Amped FIVE or iNPUT-ACE."),
+    h("div", {}, go, pdfBtn), status,
     h("h3", {}, "Next steps for the investigation"),
     h("ol", { class: "small" },
       h("li", {}, "Run the top candidates through your agency's plate-camera network (Flock, Vigilant) with the time, place and vehicle description."),
