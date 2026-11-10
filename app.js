@@ -885,6 +885,32 @@ function readStep(stage) {
     } catch (e) { mStatus.className = "small error"; mStatus.textContent = "The Match test couldn't run: " + (e.message || e); }
     mGo.disabled = false;
   } }, "Run Match test (Texas Classic)");
+  // Lead list: every Texas plate that could have produced this footage, ranked.
+  const lStatus = h("p", { class: "small muted" }), lBar = h("i", {}), lOut = h("div", {});
+  const leadCsv = (L) => "rank,plate,relative_score\n" + L.list.map((x, i) => `${i + 1},${x.plate},${x.rank_score}`).join("\n") + "\n";
+  const lGo = h("button", { class: "ghost", onclick: async () => {
+    lGo.disabled = true; lOut.replaceChildren(); lStatus.className = "small muted"; lStatus.textContent = "Copying the camera's damage onto test plates… (can take a minute or two on a phone)";
+    try {
+      const L = await PTMatch.leads(C.combinedRaw, { originalHeight: C.combinedRaw.height / upNow() }, (f) => (lBar.style.width = `${Math.round(f * 100)}%`));
+      C.leads = L;
+      logStep("lead_list", { plausible_plates: L.plausible_total, fit: L.fit, kept_per_spot: L.positions.map((p) => `${p.pos}:${p.kept}`), top: L.list.slice(0, 5).map((x) => x.plate) });
+      const narrowed = L.positions.some((p) => p.ruled_out);
+      lStatus.textContent = narrowed
+        ? `${L.plausible_total.toLocaleString()} Texas plates could have produced this footage (out of 80,000,000). Ranked best fit first.`
+        : `The fit with the footage is only ${Math.round(L.fit * 100)}%, so no plates are ruled out. The list below is still ranked by fit, but treat the order as weak.`;
+      lOut.replaceChildren(
+        h("table", {}, h("tr", {}, h("th", {}, "Spot"), h("th", {}, "Still possible"), h("th", {}, "Ruled out")),
+          L.positions.map((p) => h("tr", {}, h("td", {}, p.pos), h("td", { class: "plate", style: "font-size:13px" }, p.kept), h("td", { class: "small muted" }, p.ruled_out || "none")))),
+        h("div", { class: "chips", style: "margin-top:8px" }, L.list.slice(0, 40).map((x, i) => h("span", { class: "chip plate", title: `relative score ${x.rank_score}` }, `${i + 1}. ${x.plate}`))),
+        h("p", { class: "small" }, "Check the top of this list against plate-camera hits near the time and place, and against registrations matching the vehicle (step 5). Every entry is a lead, not an identification."),
+        h("button", { class: "ghost", style: "margin-top:8px", onclick: () => { downloadText(`PlateTrace_${C.caseNo.replace(/[^\w-]+/g, "_")}_lead_list.csv`, leadCsv(L), "text/csv"); audit("lead_list_download", { rows: L.list.length }); } },
+          `Download the ranked list (${L.list.length.toLocaleString()} rows, .csv)`));
+    } catch (e) { lStatus.className = "small error"; lStatus.textContent = "The lead list couldn't be built: " + (e.message || e); }
+    lGo.disabled = false;
+  } }, "Build lead list (Texas Classic)");
+  const leadCard = h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Lead list (Texas Classic plates)"),
+    h("p", { class: "small muted" }, "For footage too poor to read. PlateTrace copies the camera's damage (low resolution, blur, glare) onto every possible Texas plate and keeps the ones that could have produced this image, best fit first. It never rules a plate out unless the footage clearly contradicts it."),
+    lGo, h("div", { class: "progress" }, lBar), lStatus, lOut);
   const matchCard = h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Match test (Texas Classic plates)"),
     h("p", { class: "small muted" }, "Compares the combined image against real Texas plate letters and numbers, blurred to match the footage. It doesn't guess: a spot shows ? unless one character clearly wins and keeps winning when the fit is re-run. For the white Texas Classic plate (ABC-1234 with the Texas outline) only."),
     mGo, h("div", { class: "progress" }, mBar), mStatus, mOut);
@@ -892,7 +918,7 @@ function readStep(stage) {
     h("div", { class: "row" }, h("label", {}, "State / plate layout", fmt, custom), h("label", {}, "Known characters (? = unknown)", mask)),
     h("label", { class: "small", style: "display:flex;gap:8px;align-items:center;margin-top:6px" }, noIOQ, "This state doesn't issue the letters I, O or Q (many don't; check yours). Removes them from the guesses."),
     h("p", { class: "small muted" }, "Tip: type the characters you can see and put ? for the ones you can't (e.g. 7?K4?2). PlateTrace then lists every plate that fits, ranked."),
-    h("div", { style: "margin-top:10px" }, go), h("div", { class: "progress" }, bar), status, results, matchCard, h("div", { style: "margin-top:12px" }, next));
+    h("div", { style: "margin-top:10px" }, go), h("div", { class: "progress" }, bar), status, results, matchCard, leadCard, h("div", { style: "margin-top:12px" }, next));
 }
 
 // ---------- step 5: vehicle details (the rest of the "fingerprint") ----------
@@ -1323,6 +1349,15 @@ async function buildReportPdf(report, images) {
     table([{ label: "Spot" }, { label: "Result", mono: true }, { label: "Best matches (share)" }, { label: "Stable" }],
       mt.positions.map((p) => [p.pos, p.result, p.top.map((t) => `${t.ch} ${t.share}%`).join(", "), p.stable]), [36, 50, TW - 140, 54], 8.5);
   }
+  if (report.lead_list) {
+    const L = report.lead_list;
+    y -= 6; text(`Lead list (Texas Classic): ${L.plausible_total.toLocaleString()} plates could have produced the footage`, { size: 10, f: bold });
+    text(`Method: ${L.method}. ${L.rule} Fit ${Math.round(L.fit * 100)}%. Full ranked list in lead_list.csv.`, { size: 8.5 });
+    table([{ label: "Spot" }, { label: "Still possible", mono: true }, { label: "Ruled out", mono: true }], L.positions.map((p) => [p.pos, p.kept, p.ruled_out || "none"]), [36, TW / 2 - 18, TW / 2 - 18], 8.5);
+    const t = L.list.slice(0, 30);
+    table([{ label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }, { label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }],
+      Array.from({ length: Math.ceil(t.length / 2) }, (_, i) => [i + 1, t[i].plate, t[i].rank_score, t[i + 15] ? i + 16 : "", t[i + 15]?.plate || "", t[i + 15]?.rank_score ?? ""]), [40, 90, 54, 40, 90, 54]);
+  }
   y -= 6; text("All reads (for transparency):", { size: 9, f: bold });
   table([{ label: "Version read" }, { label: "Text", mono: true }, { label: "Reader confidence" }], report.reads.map((r) => [r.source, r.text || "-", r.conf + "%"]), [220, 140, TW - 360], 8.5);
 
@@ -1383,6 +1418,7 @@ function packageStep(stage) {
         for (const a of sc.areas) await add(`print_pattern/area_${String(a.n).padStart(2, "0")}.png`, a.crop);
       }
     }
+    if (C.leads) { const buf = new TextEncoder().encode("rank,plate,relative_score\n" + C.leads.list.map((x, i) => `${i + 1},${x.plate},${x.rank_score}`).join("\n") + "\n"); manifest.push({ file: "lead_list.csv", sha256: await sha256(buf) }); zip.file("lead_list.csv", buf); }
     if (C.partial && !C.partial.error) { const buf = new TextEncoder().encode(partialCsv(C.partial)); manifest.push({ file: "partial_plate_list.csv", sha256: await sha256(buf) }); zip.file("partial_plate_list.csv", buf); }
     logStep("package_built", { files: manifest.length + 1 });
     const report = {
@@ -1393,6 +1429,7 @@ function packageStep(stage) {
       frames: used.map((f, i) => ({ n: i + 1, at: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp, weight: f.weight ?? 1 })),
       processing: { ...C.params, alignment: "normalized cross-correlation with sub-pixel parabola fit", combining: "mean of aligned frames" },
       read_settings: C.readSettings, reads: C.reads, candidates: C.candidates, match_test: C.match || null,
+      lead_list: C.leads ? { ...C.leads, list: C.leads.list.slice(0, 200), full_list_file: "lead_list.csv" } : null,
       partial_list: C.partial ? { ...C.partial, list: C.partial.list?.slice(0, 200) || [], full_list_file: C.partial.error ? null : "partial_plate_list.csv" } : null,
       vehicle: C.vehicle ? { rear_box: C.vehicle.box, frames_combined: C.vehicle.frames, paint_finish: C.vehicle.finish || null,
         paint_samples: (C.vehicle.samples || []).map((sm) => ({ label: sm.label, box: sm.box, as_recorded: sm.raw, corrected: sm.corrected, surface: sm.evenness, difference_from_A: sm.delta, possible_panel_mismatch: sm.flag })),

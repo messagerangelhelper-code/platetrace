@@ -86,9 +86,16 @@ const PTMatch = (() => {
     x.drawImage(glyphs._sep, L.sep * S, y0 * S, ((SEP_W * BOXW) / GW) * m.p * S, m.h * S);
     const d = document.createElement("canvas"); d.width = obs.W; d.height = obs.H;
     const dx = d.getContext("2d"); dx.imageSmoothingQuality = "high"; dx.drawImage(c, 0, 0, obs.W, obs.H);
+    if (m.res && m.res < 0.95) {                       // camera resolution: shrink to the recorded pixel size, then zoom back
+      const sm = document.createElement("canvas"); sm.width = Math.max(4, Math.round(obs.W * m.res)); sm.height = Math.max(4, Math.round(obs.H * m.res));
+      sm.getContext("2d").drawImage(d, 0, 0, sm.width, sm.height);
+      dx.clearRect(0, 0, obs.W, obs.H); dx.drawImage(sm, 0, 0, obs.W, obs.H);
+    }
     const p = dx.getImageData(0, 0, obs.W, obs.H).data, g = new Float32Array(obs.W * obs.H);
     for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = p[j];
-    return { g: gauss(g, obs.W, obs.H, m.sigma), L };
+    const out = gauss(g, obs.W, obs.H, m.sigma);
+    if (m.gamma && m.gamma !== 1) for (let i = 0; i < out.length; i++) out[i] = 255 * Math.pow(Math.max(0, out[i]) / 255, m.gamma);   // glare washes dark strokes out
+    return { g: out, L };
   }
 
   function ncc(a, b, W, x0, y0, x1, y1, ink) {
@@ -153,7 +160,9 @@ const PTMatch = (() => {
     return { s, m, score };
   }
 
-  async function run(img, opt = {}, onProgress = () => {}) {
+  let lastFit = null;
+  async function fitPlate(img, onProgress) {
+    if (lastFit && lastFit.img === img) { onProgress(1); return lastFit; }
     await load();
     const obs = toWork(img), est = estimate(obs);
     const lim = { x0: [est.x0, est.p * 0.6], p: [est.p, est.p * 0.15], yc: [est.yc, est.h * 0.25], h: [est.h, est.h * 0.3] };
@@ -172,6 +181,12 @@ const PTMatch = (() => {
     const mm = main.m, refits = [];
     const starts = [{ ...mm, h: mm.h * 0.92 }, { ...mm, h: mm.h * 1.08 }, { ...mm, x0: mm.x0 + mm.p * 0.25, sigma: mm.sigma + 0.6 }, { ...mm, x0: mm.x0 - mm.p * 0.25, sigma: Math.max(0.4, mm.sigma - 0.5) }];
     for (let k = 0; k < starts.length; k++) refits.push(await fit(main.s, starts[k], obs, lim, onProgress, 0.7 + 0.075 * k, 0.775 + 0.075 * k));
+    lastFit = { img, obs, main, mm, refits };
+    return lastFit;
+  }
+
+  async function run(img, opt = {}, onProgress = () => {}) {
+    const { obs, main, mm, refits } = await fitPlate(img, onProgress);
     const enough = main.score >= MIN_FIT;
     const positions = [...main.s].map((_, i) => {
       const sorted = spotScores(main.s, i, mm, obs);
@@ -192,5 +207,40 @@ const PTMatch = (() => {
     };
   }
 
-  return { run };
+
+  // Lead list: copy every kind of damage onto test plates (camera resolution, focus/motion blur,
+  // glare) and keep every Texas plate whose characters could have produced this footage.
+  const DROP = 0.2, LEAD_MIN_FIT = 0.88;                   // a character is ruled out if it scores this far below the best one under every damage setting
+  async function leads(img, opt = {}, onProgress = () => {}) {
+    const { obs, main, mm } = await fitPlate(img, (f) => onProgress(f * 0.5));
+    const res = opt.originalHeight ? Math.min(1, opt.originalHeight / obs.H) : 1;
+    const variants = [];
+    for (const sf of [0.7, 1, 1.4]) for (const gamma of [1, 0.6, 0.35]) for (const r of res < 0.95 ? [1, res] : [1])
+      variants.push({ ...mm, sigma: Math.max(0.3, mm.sigma * sf), gamma, res: r });
+    const per = [];
+    for (let i = 0; i < 7; i++) {
+      const best = {};
+      for (const v of variants) for (const [ch, sc] of spotScores(main.s, i, v, obs)) best[ch] = Math.max(best[ch] ?? -1, sc);
+      const sorted = Object.entries(best).sort((a, b) => b[1] - a[1]);
+      const kept = main.score >= LEAD_MIN_FIT ? sorted.filter(([, v]) => v >= sorted[0][1] - DROP) : sorted;
+      const ex = kept.map(([, v]) => Math.exp((v - sorted[0][1]) / TEMP)), z = ex.reduce((a, b) => a + b, 0);
+      per.push({ pos: i + 1, kept: kept.map(([ch, v], j) => ({ ch, score: Math.round(v * 100) / 100, p: ex[j] / z })), ruled_out: sorted.filter((e) => !kept.includes(e)).map(([ch]) => ch).join("") });
+      onProgress(0.5 + (0.45 * (i + 1)) / 7); await pause();
+    }
+    const total = per.reduce((n, q) => n * q.kept.length, 1);
+    let beam = [["", 1]];
+    for (const q of per) { beam = beam.flatMap(([s, p]) => q.kept.map((k) => [s + k.ch, p * k.p])).sort((a, b) => b[1] - a[1]).slice(0, 20000); }
+    const top = beam[0]?.[1] || 1;
+    onProgress(1);
+    return {
+      method: "forward model: Texas Classic test plates degraded by the same camera resolution, focus/motion blur and glare as the footage, scored by normalized cross-correlation; characters that score far below the best under every damage setting are ruled out; nothing is ruled out when the overall fit is weak",
+      damage_settings: { blur_sigma_px: [0.7, 1, 1.4].map((f) => Math.round(Math.max(0.3, mm.sigma * f) * 10) / 10), glare_gamma: [1, 0.6, 0.35], recorded_resolution: res < 0.95 ? Math.round(res * 100) / 100 : "full" },
+      rule: `A character is kept unless it scores more than ${DROP} below the best character at that spot under every damage setting. If the whole-plate fit is under ${Math.round(LEAD_MIN_FIT * 100)}%, nothing is ruled out. The list is ranked by how well each plate fits; every entry is a lead, not an identification.`,
+      fit: Math.round(main.score * 100) / 100, plausible_total: total, complete: total <= 20000,
+      positions: per.map((q) => ({ pos: q.pos, kept: q.kept.map((k) => k.ch).join(""), ruled_out: q.ruled_out })),
+      list: beam.map(([s, p]) => ({ plate: s.slice(0, 3) + "-" + s.slice(3), rank_score: Math.round((p / top) * 1000) / 10 })),
+    };
+  }
+
+  return { run, leads };
 })();
