@@ -6,7 +6,8 @@ const SB_URL = "https://wbugdujmydwmzemccbiy.supabase.co";
 const SB_KEY = "sb_publishable_4RYit1aVs5Egh3gJsx2bJA_m6Kje0ES";
 const ADMIN_EMAILS = ["cashcowaiadmin@gmail.com"];
 const VERSION = "PlateTrace demo 0.1";
-const UP = 4;                                   // detail factor for combined images
+const UP = 4;                                   // default detail factor ("zoom closer") for combined images
+const upNow = () => (C && C.up) || UP;
 
 const sb = window.supabase.createClient(SB_URL, SB_KEY);
 const $app = document.getElementById("app");
@@ -408,7 +409,10 @@ function framesStep(stage) {
   const from = h("input", { type: "number", step: "0.1", min: 0, value: isVideo ? Math.max(0, C.refTime - 1.5).toFixed(1) : 0 });
   const to = h("input", { type: "number", step: "0.1", min: 0, value: isVideo ? Math.min(dur, C.refTime + 1.5).toFixed(1) : 0 });
   const samples = h("input", { type: "number", min: 4, max: 90, value: 30 });
-  const keep = h("input", { type: "number", min: 1, max: 40, value: 12 });
+  const keep = h("input", { type: "number", min: 1, max: 40, value: 12, disabled: true });
+  const far = h("input", { type: "checkbox", checked: true, style: "width:auto" });
+  far.addEventListener("change", () => (keep.disabled = far.checked));
+  const zoom = h("select", {}, [4, 6, 8].map((z) => h("option", { value: z }, `${z}× ${z === 4 ? "(standard)" : z === 6 ? "(far away)" : "(very far / tiny plate)"}`)));
   const bar = h("i", {});
   const status = h("p", { class: "small muted" });
   const thumbs = h("div", { class: "thumbs" });
@@ -416,6 +420,9 @@ function framesStep(stage) {
   const run = async () => {
     go.disabled = true; next.disabled = true; thumbs.replaceChildren();
     const box = C.box;
+    C.up = clamp(+zoom.value, 2, 8);
+    while (C.up > 2 && box.w * C.up > 1800) C.up -= 2;          // keep very large plate boxes manageable
+    C.farMode = far.checked;
     let srcW, srcH, grab, times;
     const frameCanvas = canvasOf(1, 1);
     const fctx = frameCanvas.getContext("2d", { willReadFrequently: true });
@@ -439,7 +446,7 @@ function framesStep(stage) {
     for (let k = 0; k < times.length; k++) {
       await grab(times[k]);
       const al = alignTo(ref, box, fctx, srcW, srcH);
-      const big = canvasOf(box.w * UP, box.h * UP);
+      const big = canvasOf(box.w * C.up, box.h * C.up);
       const bctx = big.getContext("2d", { willReadFrequently: true });
       bctx.imageSmoothingEnabled = true; bctx.imageSmoothingQuality = "high";
       bctx.drawImage(frameCanvas, box.x + al.dx, box.y + al.dy, box.w, box.h, 0, 0, big.width, big.height);
@@ -449,36 +456,94 @@ function framesStep(stage) {
       status.textContent = `Checked ${k + 1} of ${times.length} frames…`;
     }
     // keep frames that really line up with the plate, then the sharpest of those
-    const good = found.filter((f) => f.match >= 0.5);
+    // Far / blurry mode: every frame that shows the plate is used; sharper frames simply count more when combined.
+    const good = found.filter((f) => f.match >= (C.farMode ? 0.4 : 0.5));
     const dropped = found.length - good.length;
     good.sort((a, b) => b.sharp - a.sharp);
-    C.frames = good.slice(0, clamp(Math.round(+keep.value), 1, 40)).map((f) => ({ ...f, use: true }));
-    logStep("frames_scanned", { checked: found.length, dropped_poor_match: dropped, kept: C.frames.length, range: isVideo ? [+from.value, +to.value] : "all photos" });
-    C.frames.forEach((f, i) => logStep("frame_kept", { n: i + 1, frame: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp }));
+    C.frames = (C.farMode ? good : good.slice(0, clamp(Math.round(+keep.value), 1, 40))).map((f) => ({ ...f, use: true }));
+    const maxSharp = Math.max(1e-6, ...C.frames.map((f) => f.sharp));
+    C.frames.forEach((f) => (f.weight = C.farMode ? +(0.25 + 0.75 * (f.sharp / maxSharp)).toFixed(3) : 1));
+    logStep("frames_scanned", { checked: found.length, dropped_poor_match: dropped, kept: C.frames.length, far_blurry_mode: C.farMode, zoom: C.up, range: isVideo ? [+from.value, +to.value] : "all photos" });
+    C.frames.forEach((f, i) => logStep("frame_kept", { n: i + 1, frame: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp, weight: f.weight }));
     status.textContent = C.frames.length
-      ? `Kept the ${C.frames.length} clearest well-matched frames${dropped ? ` (${dropped} skipped because the plate didn't line up)` : ""}. Untick any that look wrong.`
+      ? (C.farMode ? `Using all ${C.frames.length} frames that show the plate, at ${C.up}× zoom; sharper frames count more` : `Kept the ${C.frames.length} clearest well-matched frames`) + `${dropped ? ` (${dropped} skipped because the plate didn't line up)` : ""}. Untick any that look wrong.`
       : "No frames lined up with the plate. Try a smaller time range or re-mark the plate.";
     C.frames.forEach((f, i) => {
       const cb = h("input", { type: "checkbox", checked: true, style: "width:auto", onchange: (e) => { f.use = e.target.checked; next.disabled = !C.frames.some((x) => x.use); } });
       thumbs.append(h("figure", {}, h("img", { src: canvasFromData(f.img).toDataURL(), alt: `Frame ${i + 1}` }),
         h("figcaption", {}, h("label", { style: "display:flex;gap:6px;align-items:center;margin:0;font-weight:400" }, cb, `#${i + 1} · ${isVideo ? f.at + " s" : f.at}`),
-          `match ${f.match} · sharp ${f.sharp}`)));
+          `match ${f.match} · sharp ${f.sharp}${C.farMode ? ` · counts ${Math.round(f.weight * 100)}%` : ""}`)));
     });
     next.disabled = !C.frames.length; go.disabled = false;
   };
   const go = h("button", { onclick: run }, isVideo ? "Find the clearest frames" : "Line up the photos");
   stage.replaceChildren(stepsBar(2), h("h2", {}, "Find the clearest frames"),
-    isVideo ? h("div", { class: "row" }, h("label", {}, "From (seconds)", from), h("label", {}, "To (seconds)", to), h("label", {}, "Frames to check", samples), h("label", {}, "Keep the best", keep))
+    isVideo ? h("div", { class: "row" }, h("label", {}, "From (seconds)", from), h("label", {}, "To (seconds)", to), h("label", {}, "Frames to check", samples), h("label", {}, "Keep the best (when far mode is off)", keep))
       : h("p", { class: "small muted" }, `${C.images.length} photo(s) will be lined up to the first one.`),
+    h("div", { class: "row", style: "margin-top:8px" }, h("label", {}, "Zoom closer", zoom),
+      h("label", { style: "display:flex;gap:8px;align-items:center" }, far, "Far away or blurry footage: use every frame that shows the plate (sharper frames count more)")),
+    h("p", { class: "small muted" }, "For a small or distant plate, use 6× or 8× and check more frames (e.g. 60). Each frame is placed to a fraction of a pixel, so together they hold more detail than any one frame. Nothing is guessed or drawn in."),
     h("div", { style: "margin-top:10px" }, go), h("div", { class: "progress" }, bar), status, thumbs, h("div", { style: "margin-top:12px" }, next));
 }
 
 // ---------- step 3: combine and enhance ----------
-function averageFrames(frames) {
+function averageFrames(frames) {               // weighted mean (weights are 1 unless far / blurry mode set them)
   const w = frames[0].img.width, hgt = frames[0].img.height, acc = new Float32Array(w * hgt * 3);
-  for (const f of frames) { const d = f.img.data; for (let i = 0, j = 0; j < d.length; i += 3, j += 4) { acc[i] += d[j]; acc[i + 1] += d[j + 1]; acc[i + 2] += d[j + 2]; } }
+  let W = 0;
+  for (const f of frames) { const wt = f.weight ?? 1; W += wt; const d = f.img.data; for (let i = 0, j = 0; j < d.length; i += 3, j += 4) { acc[i] += wt * d[j]; acc[i + 1] += wt * d[j + 1]; acc[i + 2] += wt * d[j + 2]; } }
   const out = new ImageData(w, hgt);
-  for (let i = 0, j = 0; j < out.data.length; i += 3, j += 4) { out.data[j] = acc[i] / frames.length; out.data[j + 1] = acc[i + 1] / frames.length; out.data[j + 2] = acc[i + 2] / frames.length; out.data[j + 3] = 255; }
+  for (let i = 0, j = 0; j < out.data.length; i += 3, j += 4) { out.data[j] = acc[i] / W; out.data[j + 1] = acc[i + 1] / W; out.data[j + 2] = acc[i + 2] / W; out.data[j + 3] = 255; }
+  return out;
+}
+
+// ---------- unblur: Richardson-Lucy deconvolution ----------
+// A standard, published method (also used in forensic video tools). It reverses a known blur
+// shape mathematically; it does not add or predict detail. Every setting is logged.
+function blurKernel(kind, size, angleDeg) {
+  if (kind === "focus") {                       // out-of-focus / distance blur: Gaussian, sigma = size
+    const r = Math.max(1, Math.ceil(size * 3)), k = [];
+    for (let i = -r; i <= r; i++) k.push(Math.exp(-(i * i) / (2 * size * size)));
+    const s = k.reduce((a, b) => a + b, 0); return { kind, r, k: k.map((v) => v / s) };
+  }
+  const L = Math.max(2, Math.round(size)), a = (angleDeg * Math.PI) / 180, pts = [];   // motion: straight streak
+  for (let i = 0; i < L; i++) { const t = i - (L - 1) / 2; pts.push([t * Math.cos(a), -t * Math.sin(a)]); }
+  return { kind, pts };
+}
+function convolve(src, w, hgt, K) {
+  const out = new Float32Array(src.length);
+  if (K.kind === "focus") {
+    const tmp = new Float32Array(src.length), { r, k } = K;
+    for (let y = 0; y < hgt; y++) for (let x = 0; x < w; x++) { let s = 0; for (let i = -r; i <= r; i++) s += k[i + r] * src[y * w + clamp(x + i, 0, w - 1)]; tmp[y * w + x] = s; }
+    for (let y = 0; y < hgt; y++) for (let x = 0; x < w; x++) { let s = 0; for (let i = -r; i <= r; i++) s += k[i + r] * tmp[clamp(y + i, 0, hgt - 1) * w + x]; out[y * w + x] = s; }
+    return out;
+  }
+  const n = K.pts.length;
+  const pts = K.pts.map(([dx, dy]) => { const fx = Math.floor(dx), fy = Math.floor(dy); return [fx, fy, dx - fx, dy - fy]; });
+  for (let y = 0; y < hgt; y++) for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (const [fx, fy, ax, ay] of pts) {
+      const x0 = clamp(x + fx, 0, w - 1), x1 = clamp(x + fx + 1, 0, w - 1), y0 = clamp(y + fy, 0, hgt - 1), y1 = clamp(y + fy + 1, 0, hgt - 1);
+      s += (src[y0 * w + x0] * (1 - ax) + src[y0 * w + x1] * ax) * (1 - ay) + (src[y1 * w + x0] * (1 - ax) + src[y1 * w + x1] * ax) * ay;
+    }
+    out[y * w + x] = s / n;
+  }
+  return out;
+}
+function richardsonLucy(img, opt) {
+  if (!opt || opt.kind === "off") return img;
+  const w = img.width, hgt = img.height, K = blurKernel(opt.kind, opt.size, opt.angle || 0), out = new ImageData(w, hgt);
+  for (let c = 0; c < 3; c++) {
+    const obs = new Float32Array(w * hgt); for (let i = 0; i < obs.length; i++) obs[i] = img.data[i * 4 + c] + 1;
+    let est = Float32Array.from(obs);
+    for (let it = 0; it < opt.iterations; it++) {
+      const conv = convolve(est, w, hgt, K), ratio = new Float32Array(obs.length);
+      for (let i = 0; i < obs.length; i++) ratio[i] = obs[i] / (conv[i] + 1e-3);
+      const corr = convolve(ratio, w, hgt, K);   // both blur shapes are symmetric, so the mirror kernel is the same
+      for (let i = 0; i < est.length; i++) est[i] = clamp(est[i] * corr[i], 0, 400);
+    }
+    for (let i = 0; i < est.length; i++) out.data[i * 4 + c] = clamp(est[i] - 1, 0, 255);
+  }
+  for (let i = 0; i < w * hgt; i++) out.data[i * 4 + 3] = 255;
   return out;
 }
 function toGray(img) {
@@ -502,7 +567,7 @@ function enhance(img, amount, gray) {
   const res = chans.map((ch) => {
     const st = ch.map((v) => clamp(((v - lo) / span) * 255, 0, 255));
     if (!amount) return st;
-    const bl = boxBlur(boxBlur(st, w, hgt, UP / 2), w, hgt, UP / 2);
+    const rr = Math.max(1, Math.round(upNow() / 2)), bl = boxBlur(boxBlur(st, w, hgt, rr), w, hgt, rr);
     return st.map((v, i) => clamp(v + amount * (v - bl[i]), 0, 255));
   });
   for (let i = 0; i < w * hgt; i++) {
@@ -518,21 +583,52 @@ function combineStep(stage) {
   const amount = h("input", { type: "range", min: 0, max: 2.5, step: 0.1, value: 1.2 });
   const gray = h("input", { type: "checkbox", checked: true, style: "width:auto" });
   const imgBest = h("img", { alt: "Clearest single frame" }), imgComb = h("img", { alt: "Combined frames, enhanced" });
+  const ub = { kind: h("select", {}, h("option", { value: "off" }, "Off"), h("option", { value: "focus" }, "Out of focus / far away"), h("option", { value: "motion" }, "Motion streak (car moving)")),
+    size: h("input", { type: "range", min: 0.5, max: 3 * upNow(), step: 0.5, value: upNow() / 2 }), angle: h("input", { type: "range", min: 0, max: 175, step: 5, value: 0 }),
+    iter: h("input", { type: "range", min: 5, max: 40, step: 5, value: 15 }) };
+  const ubInfo = h("span", { class: "small muted" });
+  const ubAngleRow = h("label", { style: "display:none" }, "Streak direction", ub.angle);
+  const ubStatus = h("p", { class: "small muted" });
+  let deblurred = C.combinedRaw, deblurredBest = C.best.img;
+  const ubOpt = () => ({ kind: ub.kind.value, size: +ub.size.value * (ub.kind.value === "motion" ? 1 : 1), iterations: +ub.iter.value, angle: +ub.angle.value });
+  const ubLabel = () => { const o = ubOpt(); ubAngleRow.style.display = o.kind === "motion" ? "" : "none";
+    ubInfo.textContent = o.kind === "off" ? "" : o.kind === "focus" ? `blur size ${o.size} px · ${o.iterations} rounds` : `streak ${o.size} px at ${o.angle}° · ${o.iterations} rounds`; };
   const paint = () => {
-    C.params = { frames_combined: used.length, detail_factor: UP, contrast: "stretch 1st-99th percentile", sharpen_amount: +amount.value, grayscale: gray.checked };
-    C.combined = enhance(C.combinedRaw, +amount.value, gray.checked);
-    C.bestEnh = enhance(C.best.img, +amount.value, gray.checked);
+    const o = ubOpt();
+    C.params = { frames_combined: used.length, detail_factor: upNow(), far_blurry_mode: !!C.farMode, weighting: C.farMode ? "sharpness-weighted mean" : "mean",
+      unblur: o.kind === "off" ? null : { method: "Richardson-Lucy deconvolution", blur: o.kind === "focus" ? "Gaussian (out of focus / distance)" : "straight motion streak", size_px_at_zoom: o.size, angle_deg: o.kind === "motion" ? o.angle : null, iterations: o.iterations },
+      contrast: "stretch 1st-99th percentile", sharpen_amount: +amount.value, grayscale: gray.checked };
+    C.combined = enhance(deblurred, +amount.value, gray.checked);
+    C.bestEnh = enhance(deblurredBest, +amount.value, gray.checked);
     imgComb.src = canvasFromData(C.combined).toDataURL();
     imgBest.src = canvasFromData(C.bestEnh).toDataURL();
   };
+  const applyUnblur = async () => {
+    const o = ubOpt(); ubBtn.disabled = true;
+    if (o.kind === "off") { deblurred = C.combinedRaw; deblurredBest = C.best.img; ubStatus.textContent = "Unblur is off."; }
+    else {
+      ubStatus.textContent = "Unblurring… (this can take a few seconds)"; await new Promise((r) => setTimeout(r, 30));
+      const t0 = performance.now();
+      deblurred = richardsonLucy(C.combinedRaw, o); deblurredBest = richardsonLucy(C.best.img, o);
+      ubStatus.textContent = `Unblur applied in ${((performance.now() - t0) / 1000).toFixed(1)} s. Compare with the single frame; if edges ring or look doubled, lower the blur size or rounds.`;
+    }
+    paint(); ubBtn.disabled = false;
+  };
+  const ubBtn = h("button", { class: "ghost", onclick: applyUnblur }, "Apply unblur");
+  [ub.kind, ub.size, ub.angle, ub.iter].forEach((el) => el.addEventListener("input", ubLabel));
+  ubLabel();
   amount.addEventListener("input", paint); gray.addEventListener("change", paint);
   paint();
   const next = h("button", { onclick: () => { logStep("combined", C.params); readStep(stage); } }, "Next: read the plate");
   stage.replaceChildren(stepsBar(3), h("h2", {}, "Combine and enhance"),
-    h("p", { class: "small muted" }, `${used.length} lined-up frames averaged at ${UP}× detail. Averaging lowers noise and blur that changes from frame to frame; it doesn't invent detail.`),
+    h("p", { class: "small muted" }, `${used.length} lined-up frames ${C.farMode ? "combined (sharper frames count more)" : "averaged"} at ${upNow()}× zoom. Combining lowers noise and blur that changes from frame to frame; it doesn't invent detail.`),
     h("div", { class: "result-imgs" }, h("figure", { style: "margin:0" }, imgBest, h("figcaption", { class: "small muted" }, "Clearest single frame")),
       h("figure", { style: "margin:0" }, imgComb, h("figcaption", { class: "small muted" }, `Combined (${used.length} frames)`))),
     h("div", { class: "row", style: "margin-top:10px" }, h("label", {}, "Sharpen", amount), h("label", { style: "display:flex;gap:8px;align-items:center" }, gray, "Black & white")),
+    h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Unblur"),
+      h("p", { class: "small muted" }, "Reverses blur with a published math method (Richardson–Lucy). It does not guess letters or draw anything in. Start small and raise the blur size until the characters' edges get crisp, then stop."),
+      h("div", { class: "row" }, h("label", {}, "Kind of blur", ub.kind), h("label", {}, "Blur size", ub.size), ubAngleRow, h("label", {}, "Rounds", ub.iter)),
+      h("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px" }, ubBtn, ubInfo), ubStatus),
     h("div", { style: "margin-top:12px" }, next));
 }
 
@@ -1154,7 +1250,8 @@ async function buildReportPdf(report, images) {
     `Marking: the examiner drew a box around the plate${report.reference_time_s != null ? ` at ${Number(report.reference_time_s).toFixed(2)} s into the video` : ""}.`,
     "Finding frames: nearby frames were searched for the same plate using normalized cross-correlation (a standard pattern-matching measure). Each frame's sharpness was scored, and blurry or poorly matching frames were left out.",
     "Lining up: each kept frame was shifted, to a fraction of a pixel, so the plate sits in the same place in every frame. The shifts are listed in the case report.",
-    `Combining: the lined-up frames were enlarged ${report.processing.upscale || UP}x and averaged. Averaging reduces random noise; it cannot create detail that was not recorded.`,
+    `Combining: the lined-up frames were enlarged ${report.processing.detail_factor || UP}x and ${report.processing.far_blurry_mode ? "combined with a sharpness-weighted average (far/blurry mode: every frame showing the plate was used; sharper frames counted more, none were dropped for blur)" : "averaged"}. Combining reduces random noise; it cannot create detail that was not recorded.`,
+    ...(report.processing.unblur ? [`Unblur: Richardson-Lucy deconvolution (${report.processing.unblur.blur}, size ${report.processing.unblur.size_px_at_zoom} px at zoom${report.processing.unblur.angle_deg != null ? `, angle ${report.processing.unblur.angle_deg} degrees` : ""}, ${report.processing.unblur.iterations} rounds). This published method mathematically reverses a known blur shape; it does not add or predict detail.`] : []),
     `Enhancing: contrast stretch and unsharp-mask sharpening (amount ${report.processing.sharpen_amount ?? "-"}) were applied. These are standard, reversible adjustments.`,
     `Reading: open-source optical character recognition (Tesseract) read each version. Characters were combined by weighted vote at each position${report.read_settings?.layouts?.length ? `, then fitted to the layout ${report.read_settings.layouts.join(" / ")}` : ""}; look-alike characters (for example 0/O, 8/B) were only swapped where the layout requires it, and every swap is noted.`,
     "No generative AI was used. No pixels were invented, painted in or predicted; every output comes only from the recorded pixels.",
@@ -1241,7 +1338,7 @@ function packageStep(stage) {
       agency: S.access?.agency || (S.isAdmin ? "PlateTrace admin" : null),
       originals: C.files.map((f) => ({ name: f.name, bytes: f.size, type: f.type, sha256: f.sha256 })),
       plate_box: C.box, reference_time_s: C.refTime ?? null,
-      frames: used.map((f, i) => ({ n: i + 1, at: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp })),
+      frames: used.map((f, i) => ({ n: i + 1, at: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp, weight: f.weight ?? 1 })),
       processing: { ...C.params, alignment: "normalized cross-correlation with sub-pixel parabola fit", combining: "mean of aligned frames" },
       read_settings: C.readSettings, reads: C.reads, candidates: C.candidates,
       partial_list: C.partial ? { ...C.partial, list: C.partial.list?.slice(0, 200) || [], full_list_file: C.partial.error ? null : "partial_plate_list.csv" } : null,
