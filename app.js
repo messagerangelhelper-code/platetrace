@@ -596,9 +596,74 @@ function enhance(img, amount, gray) {
   return out;
 }
 
+
+// Automatic light & dark combining. The plate is black letters on a white background, so in every
+// frame PlateTrace measures how bright "white" and how dark "black" look, rescales the frame so
+// white = white and black = black, and then builds each pixel only from frames where that pixel was
+// recorded well (not blown out by glare, not crushed to black). Pixels no frame recorded well are
+// flagged as "no data" on the coverage map; nothing is painted in.
+function smartCombine(frames) {
+  const w = frames[0].img.width, hgt = frames[0].img.height, n = w * hgt;
+  const CLIP = 250, CRUSH = 6;
+  const stats = frames.map((f) => {
+    const d = f.img.data, vals = [];
+    const x0 = Math.round(w * 0.1), x1 = Math.round(w * 0.9), y0 = Math.round(hgt * 0.1), y1 = Math.round(hgt * 0.9);
+    let clipped = 0, tot = 0;
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+      const j = (y * w + x) * 4, mx = Math.max(d[j], d[j + 1], d[j + 2]), g = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+      tot++; if (mx >= CLIP) clipped++; else if (mx > CRUSH) vals.push(g);
+    }
+    vals.sort((a, b) => a - b);
+    const q = (p) => vals.length ? vals[Math.min(vals.length - 1, Math.floor(p * vals.length))] : 128;
+    const black = q(0.08), white = q(0.8), span = white - black;
+    return { black, white, span, clipped_pct: Math.round((clipped / Math.max(1, tot)) * 100), weight: (f.weight ?? 1) * Math.max(0.15, Math.min(1, span / 120)), usable: span >= 12 };
+  });
+  const anyUsable = stats.some((s) => s.usable);
+  // Glare is usually a patch of extra light, not a whole-frame change, so white and black are also
+  // measured locally (around each spot) and the frame is evened out spot by spot.
+  const R = Math.max(3, Math.round(hgt * 0.2));
+  const slide = (src, fn) => {
+    const tmp = new Float32Array(n), out = new Float32Array(n);
+    for (let y = 0; y < hgt; y++) for (let x = 0; x < w; x++) { let v = src[y * w + x]; for (let i = Math.max(0, x - R); i <= Math.min(w - 1, x + R); i++) v = fn(v, src[y * w + i]); tmp[y * w + x] = v; }
+    for (let y = 0; y < hgt; y++) for (let x = 0; x < w; x++) { let v = tmp[y * w + x]; for (let i = Math.max(0, y - R); i <= Math.min(hgt - 1, y + R); i++) v = fn(v, tmp[i * w + x]); out[y * w + x] = v; }
+    return boxBlur(out, w, hgt, R);
+  };
+  const acc = new Float32Array(n * 3), wsum = new Float32Array(n), good = new Uint16Array(n), fall = new Float32Array(n * 3), fallW = new Float32Array(n);
+  frames.forEach((f, k) => {
+    const s = stats[k]; if (anyUsable && !s.usable) return;
+    const d = f.img.data, gray = new Float32Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) gray[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+    const wl = slide(gray, Math.max), bl = slide(gray, Math.min);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      const mx = Math.max(d[j], d[j + 1], d[j + 2]), mn = Math.min(d[j], d[j + 1], d[j + 2]);
+      const ls = wl[i] - bl[i], local = ls >= 25;
+      const lo = local ? bl[i] : s.black, span = Math.max(1, local ? ls : s.span);
+      const r = (d[j] - lo) / span, g = (d[j + 1] - lo) / span, b = (d[j + 2] - lo) / span;
+      if (mx >= CLIP || mx <= CRUSH && mn <= CRUSH) { fall[i * 3] += r; fall[i * 3 + 1] += g; fall[i * 3 + 2] += b; fallW[i]++; continue; }
+      const near = Math.min(1, (CLIP - mx) / 40);          // almost blown out: trust it less
+      const wt = s.weight * near * (local ? Math.min(1, ls / 80) : 0.3);
+      acc[i * 3] += wt * r; acc[i * 3 + 1] += wt * g; acc[i * 3 + 2] += wt * b; wsum[i] += wt; good[i]++;
+    }
+  });
+  const out = new ImageData(w, hgt), map = new ImageData(w, hgt), most = frames.length;
+  let nodata = 0;
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    for (let c = 0; c < 3; c++) {
+      const v = wsum[i] ? acc[i * 3 + c] / wsum[i] : fallW[i] ? fall[i * 3 + c] / fallW[i] : 1;
+      out.data[j + c] = clamp(v * 230 + 12, 0, 255);
+    }
+    out.data[j + 3] = 255;
+    if (!good[i]) { nodata++; map.data.set([220, 40, 40, 255], j); }
+    else { const t = good[i] / most; map.data.set([20, Math.round(60 + 180 * t), 60, 255], j); }
+  }
+  return { img: out, map, nodata_pct: Math.round((nodata / n) * 1000) / 10,
+    frames: stats.map((s, k) => ({ n: k + 1, white_level: Math.round(s.white), black_level: Math.round(s.black), blown_out_pct: s.clipped_pct, used: !anyUsable || s.usable, weight: +s.weight.toFixed(3) })) };
+}
+
 function combineStep(stage) {
   const used = C.frames.filter((f) => f.use);
-  C.combinedRaw = averageFrames(used);
+  C.smart = smartCombine(used);
+  C.combinedRaw = C.smart.img;
   C.best = used[0];
   const amount = h("input", { type: "range", min: 0, max: 2.5, step: 0.1, value: 1.2 });
   const gray = h("input", { type: "checkbox", checked: true, style: "width:auto" });
@@ -615,7 +680,8 @@ function combineStep(stage) {
     ubInfo.textContent = o.kind === "off" ? "" : o.kind === "focus" ? `blur size ${o.size} px · ${o.iterations} rounds` : `streak ${o.size} px at ${o.angle}° · ${o.iterations} rounds`; };
   const paint = () => {
     const o = ubOpt();
-    C.params = { frames_combined: used.length, detail_factor: upNow(), far_blurry_mode: !!C.farMode, weighting: C.farMode ? "sharpness-weighted mean" : "mean",
+    C.params = { frames_combined: used.length, detail_factor: upNow(), far_blurry_mode: !!C.farMode, weighting: (C.farMode ? "sharpness-weighted" : "equal-weight") + " automatic light & dark combining (each frame rescaled to its own local white and black levels; blown-out and crushed pixels skipped per frame, nearly blown-out pixels trusted less)",
+      no_data_pct: C.smart.nodata_pct, frame_levels: C.smart.frames,
       unblur: o.kind === "off" ? null : { method: "Richardson-Lucy deconvolution", blur: o.kind === "focus" ? "Gaussian (out of focus / distance)" : "straight motion streak", size_px_at_zoom: o.size, angle_deg: o.kind === "motion" ? o.angle : null, iterations: o.iterations },
       contrast: "stretch 1st-99th percentile", sharpen_amount: +amount.value, grayscale: gray.checked };
     C.combined = enhance(deblurred, +amount.value, gray.checked);
@@ -641,9 +707,11 @@ function combineStep(stage) {
   paint();
   const next = h("button", { onclick: () => { logStep("combined", C.params); readStep(stage); } }, "Next: read the plate");
   stage.replaceChildren(stepsBar(3), h("h2", {}, "Combine and enhance"),
-    h("p", { class: "small muted" }, `${used.length} lined-up frames ${C.farMode ? "combined (sharper frames count more)" : "averaged"} at ${upNow()}× zoom. Combining lowers noise and blur that changes from frame to frame; it doesn't invent detail.`),
+    h("p", { class: "small muted" }, `${used.length} lined-up frames combined automatically at ${upNow()}× zoom${C.farMode ? " (sharper frames count more)" : ""}. Each frame is evened out to the same white and black, and glare-blown or pitch-black spots are skipped frame by frame. ${C.smart.frames.filter((f) => f.blown_out_pct > 5).length} frame(s) had glare. Combining lowers noise; it doesn't invent detail.`),
     h("div", { class: "result-imgs" }, h("figure", { style: "margin:0" }, imgBest, h("figcaption", { class: "small muted" }, "Clearest single frame")),
-      h("figure", { style: "margin:0" }, imgComb, h("figcaption", { class: "small muted" }, `Combined (${used.length} frames)`))),
+      h("figure", { style: "margin:0" }, imgComb, h("figcaption", { class: "small muted" }, `Combined (${used.length} frames)`)),
+      h("figure", { style: "margin:0" }, h("img", { alt: "Coverage map", src: canvasFromData(C.smart.map).toDataURL() }),
+        h("figcaption", { class: "small muted" }, `Coverage: brighter green = more frames recorded that spot well. Red = no frame did (${C.smart.nodata_pct}% of the plate); it is left as recorded, not filled in.`))),
     h("div", { class: "row", style: "margin-top:10px" }, h("label", {}, "Sharpen", amount), h("label", { style: "display:flex;gap:8px;align-items:center" }, gray, "Black & white")),
     h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Unblur"),
       h("p", { class: "small muted" }, "Reverses blur with a published math method (Richardson–Lucy). It does not guess letters or draw anything in. Start small and raise the blur size until the characters' edges get crisp, then stop."),
@@ -1321,7 +1389,7 @@ async function buildReportPdf(report, images) {
     `Marking: the examiner drew a box around the plate${report.reference_time_s != null ? ` at ${Number(report.reference_time_s).toFixed(2)} s into the video` : ""}.`,
     "Finding frames: nearby frames were searched for the same plate using normalized cross-correlation (a standard pattern-matching measure). Each frame's sharpness was scored, and blurry or poorly matching frames were left out.",
     "Lining up: each kept frame was shifted, to a fraction of a pixel, so the plate sits in the same place in every frame. The shifts are listed in the case report.",
-    `Combining: the lined-up frames were enlarged ${report.processing.detail_factor || UP}x and ${report.processing.far_blurry_mode ? "combined with a sharpness-weighted average (far/blurry mode: every frame showing the plate was used; sharper frames counted more, none were dropped for blur)" : "averaged"}. Combining reduces random noise; it cannot create detail that was not recorded.`,
+    `Combining: the lined-up frames were enlarged ${report.processing.detail_factor || UP}x and ${report.processing.far_blurry_mode ? "combined with a sharpness-weighted average (far/blurry mode: every frame showing the plate was used; sharper frames counted more, none were dropped for blur)" : "averaged"}. Before combining, each frame was evened out to its own measured white (plate) and black (letters) levels, and pixels blown out by glare or crushed to black in a frame were left out for that frame only${report.processing.no_data_pct != null ? `; ${report.processing.no_data_pct}% of the plate was not recorded well in any frame and is marked red on the coverage map, left as recorded` : ""}. Combining reduces random noise; it cannot create detail that was not recorded.`,
     ...(report.processing.unblur ? [`Unblur: Richardson-Lucy deconvolution (${report.processing.unblur.blur}, size ${report.processing.unblur.size_px_at_zoom} px at zoom${report.processing.unblur.angle_deg != null ? `, angle ${report.processing.unblur.angle_deg} degrees` : ""}, ${report.processing.unblur.iterations} rounds). This published method mathematically reverses a known blur shape; it does not add or predict detail.`] : []),
     `Enhancing: contrast stretch and unsharp-mask sharpening (amount ${report.processing.sharpen_amount ?? "-"}) were applied. These are standard, reversible adjustments.`,
     `Reading: open-source optical character recognition (Tesseract) read each version. Characters were combined by weighted vote at each position${report.read_settings?.layouts?.length ? `, then fitted to the layout ${report.read_settings.layouts.join(" / ")}` : ""}; look-alike characters (for example 0/O, 8/B) were only swapped where the layout requires it, and every swap is noted.`,
@@ -1404,6 +1472,7 @@ function packageStep(stage) {
     const add = async (name, canvas, pdfTitle, maxH) => { const blob = await blobOf(canvas); const buf = await blob.arrayBuffer(); manifest.push({ file: name, sha256: await sha256(buf) }); zip.file(name, buf); if (pdfTitle) pics.push([`${pdfTitle} (${name})`, buf, maxH]); };
     await add("combined_enhanced.png", canvasFromData(C.combined), "Combined and enhanced plate", 180);
     await add("combined_raw.png", canvasFromData(C.combinedRaw), "Combined plate, no sharpening", 180);
+    if (C.smart) await add("coverage_map.png", canvasFromData(C.smart.map), "Coverage map (green = recorded well in more frames, red = no frame recorded it well)", 120);
     await add("clearest_single_frame.png", canvasFromData(C.bestEnh), "Clearest single frame, same enhancement", 180);
     const used = C.frames.filter((f) => f.use);
     for (let i = 0; i < used.length; i++) await add(`frames/frame_${String(i + 1).padStart(2, "0")}.png`, canvasFromData(used[i].img));
