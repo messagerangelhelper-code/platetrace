@@ -220,15 +220,60 @@ async function renderAdmin(box) {
 }
 
 // ---------- the tool ----------
+
+async function renderTips(box, start) {
+  box.replaceChildren(h("p", { class: "small muted" }, "Loading tips…"));
+  const { data, error } = await sb.from("platetrace_tips").select("*").neq("status", "dismissed").order("created_at", { ascending: false }).limit(60);
+  if (error) { box.replaceChildren(h("p", { class: "small error" }, "Couldn't load tips: " + error.message)); return; }
+  if (!data.length) { box.replaceChildren(h("p", { class: "small muted" }, "No tips yet.")); return; }
+  const groups = [];
+  for (const r of data) { const g = r.camera_settings?.group || r.id; let G = groups.find((x) => x.g === g); if (!G) groups.push((G = { g, rows: [] })); G.rows.push(r); }
+  groups.forEach((G) => G.rows.sort((a, b) => (a.camera_settings?.shot || 1) - (b.camera_settings?.shot || 1)));
+  const fetchFiles = async (G) => Promise.all(G.rows.map(async (r) => {
+    const { data: blob, error: e } = await sb.storage.from("platetrace-tips").download(r.file_path);
+    if (e) throw e;
+    return new File([blob], r.file_path.split("/").pop(), { type: r.mime || blob.type });
+  }));
+  const setStatus = async (G, status) => { await sb.from("platetrace_tips").update({ status }).in("id", G.rows.map((r) => r.id)); renderTips(box, start); };
+  box.replaceChildren(...groups.slice(0, 30).map((G) => {
+    const r = G.rows[0], prev = h("div", {}), note = h("p", { class: "small error" });
+    const when = new Date(r.captured_at || r.created_at).toLocaleString();
+    const where = r.lat != null ? h("a", { href: `https://www.openstreetmap.org/?mlat=${r.lat}&mlon=${r.lng}#map=18/${r.lat}/${r.lng}`, target: "_blank", rel: "noopener", style: "color:var(--accent)" }, `map (±${Math.round(r.accuracy_m)} m)`) : "no location";
+    const label = r.kind === "video" ? `Video${r.camera_settings?.seconds ? ` · ${r.camera_settings.seconds}s` : ""}` : G.rows.length > 1 ? `${G.rows.length} photos (burst)` : "Photo";
+    return h("div", { style: "border-top:1px solid var(--line);padding:10px 0" },
+      h("div", { class: "row", style: "align-items:center" },
+        h("div", {}, h("b", {}, label), " ", h("span", { class: r.status === "new" ? "pill warn" : "pill" }, r.status),
+          h("div", { class: "small muted" }, `${when} · `, where, ` · ${(G.rows.reduce((n, x) => n + (x.bytes || 0), 0) / 1048576).toFixed(1)} MB`),
+          r.note ? h("div", { class: "small" }, `“${r.note}”`) : null,
+          h("div", { class: "small muted" }, r.contact ? `Contact: ${r.contact}` : "Anonymous")),
+        h("button", { class: "ghost", onclick: async () => {
+          prev.replaceChildren(h("p", { class: "small muted" }, "Loading…"));
+          try {
+            const urls = await Promise.all(G.rows.map(async (x) => (await sb.storage.from("platetrace-tips").createSignedUrl(x.file_path, 600)).data?.signedUrl));
+            prev.replaceChildren(...urls.map((u) => r.kind === "video" ? h("video", { src: u, controls: true, playsinline: true, style: "width:100%;max-width:520px;border-radius:8px" }) : h("img", { src: u, style: "width:100%;max-width:260px;border-radius:8px;margin:4px" })));
+            if (r.status === "new") sb.from("platetrace_tips").update({ status: "reviewed" }).in("id", G.rows.map((x) => x.id)).then(() => {});
+          } catch (e) { prev.replaceChildren(h("p", { class: "small error" }, e.message || String(e))); }
+        } }, "View"),
+        h("button", { onclick: async (e) => {
+          e.target.disabled = true; note.textContent = "";
+          try { const files = await fetchFiles(G); await sb.from("platetrace_tips").update({ status: "used" }).in("id", G.rows.map((x) => x.id)); await start({ rows: G.rows, files }); }
+          catch (err) { note.textContent = "Couldn't open it: " + (err.message || err); e.target.disabled = false; }
+        } }, "Open as case"),
+        h("button", { class: "danger", onclick: () => { if (confirm("Hide this tip from the list? The files are kept.")) setStatus(G, "dismissed"); } }, "Dismiss")),
+      prev, note);
+  }));
+}
+
 function renderTool(isAdmin) {
   C = null;
   const caseNo = h("input", { placeholder: "e.g. 2026-004512" });
   const examiner = h("input", { value: S.access?.full_name || "" });
   const file = h("input", { type: "file", accept: "video/*,image/*", multiple: true });
   const msg = h("p", { class: "small" });
-  const start = async () => {
+  const start = async (tip) => {
+    if (tip && !caseNo.value.trim()) caseNo.value = `TIP-${tip.rows[0].id.slice(0, 8)}`;
     if (!caseNo.value.trim() || !examiner.value.trim()) { msg.className = "small error"; msg.textContent = "Enter the case number and examiner name first."; return; }
-    const files = [...file.files];
+    const files = tip ? tip.files : [...file.files];
     if (!files.length) { msg.className = "small error"; msg.textContent = "Choose a video, or one or more photos."; return; }
     msg.className = "small muted"; msg.textContent = "Fingerprinting the original file (SHA-256)…";
     C = { caseNo: caseNo.value.trim(), examiner: examiner.value.trim(), files: [], log: [], frames: [], box: null, kind: "", combined: null };
@@ -237,10 +282,15 @@ function renderTool(isAdmin) {
     C.kind = files[0].type.startsWith("video/") ? "video" : "images";
     logStep("case_opened", { case_no: C.caseNo, examiner: C.examiner, user: S.user.email, version: VERSION });
     C.files.forEach((f) => logStep("original_file", { name: f.name, bytes: f.size, sha256: f.sha256 }));
+    if (tip) {
+      C.tip = tip.rows.map((r) => ({ id: r.id, received_at: r.created_at, captured_at: r.captured_at, kind: r.kind, sha256_at_capture: r.sha256, location: r.lat != null ? { lat: r.lat, lng: r.lng, accuracy_m: r.accuracy_m } : null, note: r.note, contact_given: !!r.contact, camera: r.camera_settings }));
+      C.files.forEach((f, i) => { const r = tip.rows[i]; logStep("public_tip", { tip_id: r.id, sha256_at_capture: r.sha256, matches_file: r.sha256 === f.sha256, captured_at: r.captured_at, location: r.lat != null ? `${r.lat.toFixed(6)}, ${r.lng.toFixed(6)} (±${r.accuracy_m} m)` : "not shared" }); });
+      if (C.files.some((f, i) => f.sha256 !== tip.rows[i].sha256)) { msg.className = "small error"; msg.textContent = "Warning: a file's fingerprint doesn't match the one taken on the phone. It may have been changed."; }
+    }
     audit("open", { files: C.files.map((f) => ({ name: f.name, sha256: f.sha256 })) });
     renderWork();
   };
-  const adminBox = h("div", {});
+  const adminBox = h("div", {}), tipsBox = h("div", {});
   const switchMsg = h("p", { class: "small muted" });
   const switchBtn = h("button", { class: S.publicMode ? "" : "ghost", onclick: async () => {
     const next = !S.publicMode;
@@ -259,6 +309,8 @@ function renderTool(isAdmin) {
     isAdmin ? h("div", { class: "card" }, h("h2", {}, "Who can use PlateTrace"),
       h("p", { class: "small muted" }, "Private = only verified agencies. Public = anyone who signs in can test it."), switchBtn, switchMsg) : null,
     testBanner,
+    isAdmin ? h("div", { class: "card" }, h("h2", {}, "Tips from the public"),
+      h("p", { class: "small muted" }, "Photos and videos sent from PlateTrace Camera (", h("a", { href: "camera/", target: "_blank", style: "color:var(--accent)" }, location.origin + "/camera/"), "). Fingerprinted on the phone when taken."), tipsBox) : null,
     isAdmin ? h("div", { class: "card" }, h("h2", {}, "Access requests"), adminBox) : null,
     h("div", { class: "card" },
       h("h1", {}, "New case"),
@@ -266,7 +318,7 @@ function renderTool(isAdmin) {
       h("div", { class: "row" }, h("label", {}, "Case number", caseNo), h("label", {}, "Examiner", examiner)),
       h("label", {}, "Footage", file),
       h("button", { style: "margin-top:12px", onclick: start }, "Open case"), msg)].filter(Boolean));
-  if (isAdmin) renderAdmin(adminBox);
+  if (isAdmin) { renderAdmin(adminBox); renderTips(tipsBox, start); }
 }
 
 function stepsBar(on) {
@@ -1480,6 +1532,12 @@ async function buildReportPdf(report, images) {
   heading("2. Original evidence");
   text("Each original file was fingerprinted with SHA-256 before any processing. The originals were never changed or uploaded; all processing ran on the examiner's own device.", { size: 9 });
   table([{ label: "File" }, { label: "Size (bytes)" }, { label: "SHA-256", mono: true }], report.originals.map((o) => [o.name, o.bytes.toLocaleString(), o.sha256]), [150, 70, TW - 220], 8);
+  if (report.public_tip?.length) {
+    y -= 4; text("Source: submitted by a member of the public through PlateTrace Camera. Each file was fingerprinted (SHA-256) on the submitter's phone at the moment of capture; the fingerprint below is compared with the file examined here.", { size: 8.5 });
+    table([{ label: "Tip" }, { label: "Captured" }, { label: "Location" }, { label: "Fingerprint matches" }],
+      report.public_tip.map((t, i) => [t.id.slice(0, 8), t.captured_at || "-", t.location ? `${t.location.lat.toFixed(5)}, ${t.location.lng.toFixed(5)} (±${Math.round(t.location.accuracy_m)} m)` : "not shared", report.originals[i] && report.originals[i].sha256 === t.sha256_at_capture ? "yes" : "NO"]), [60, 130, 170, TW - 360], 8);
+    const n = report.public_tip.find((t) => t.note)?.note; if (n) text(`Submitter's note: "${n}"`, { size: 8.5 });
+  }
 
   heading("3. Method (plain English)");
   [
@@ -1596,6 +1654,7 @@ function packageStep(stage) {
       frames: used.map((f, i) => ({ n: i + 1, at: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp, weight: f.weight ?? 1 })),
       processing: { ...C.params, alignment: "normalized cross-correlation with sub-pixel parabola fit", combining: "mean of aligned frames" },
       read_settings: C.readSettings, reads: C.reads, candidates: C.candidates, match_test: C.match || null,
+      public_tip: C.tip || null,
       reflections: (C.reflections || []).map((r) => ({ n: r.n, frame: r.at, box: r.box, match: r.match, view: r.view, size_vs_plate: r.size_vs_plate, image: `reflections/reflection_${r.n}.png` })),
       lead_list: C.leads ? { ...C.leads, list: C.leads.list.slice(0, 200), full_list_file: "lead_list.csv" } : null,
       partial_list: C.partial ? { ...C.partial, list: C.partial.list?.slice(0, 200) || [], full_list_file: C.partial.error ? null : "partial_plate_list.csv" } : null,
