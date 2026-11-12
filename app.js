@@ -329,7 +329,7 @@ function renderTool(isAdmin) {
       h("p", { class: "muted small" }, "Load a video clip, or several photos of the same vehicle. Nothing is uploaded; processing happens on this device."),
       h("div", { class: "row" }, h("label", {}, "Case number", caseNo), h("label", {}, "Examiner", examiner)),
       h("label", {}, "Footage", file),
-      h("button", { style: "margin-top:12px", onclick: start }, "Open case"), msg)].filter(Boolean));
+      h("button", { style: "margin-top:12px", onclick: () => start() }, "Open case"), msg)].filter(Boolean));
   if (isAdmin) { renderAdmin(adminBox); renderTips(tipsBox, start); }
 }
 
