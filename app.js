@@ -32,6 +32,23 @@ function h(tag, attrs, ...kids) {
 const nowIso = () => new Date().toISOString();
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+// ---------- subscription plans (Stripe checkout, 14-day free trial) ----------
+const PLANS = [
+  { name: "Starter", price: 99, for: "Private investigators and small departments", url: "https://buy.stripe.com/7sYeVf2E0bGh9lffqhak006" },
+  { name: "Agency", price: 199, for: "Mid-size departments and investigation firms", url: "https://buy.stripe.com/fZu14p0vS4dP40Vba1ak007" },
+  { name: "Enterprise", price: 299, for: "Large agencies and multi-unit teams", url: "https://buy.stripe.com/5kQcN70vS6lX9lfdi9ak008" },
+];
+function plansCard() {
+  return h("div", { class: "card", id: "plans" },
+    h("h2", {}, "Plans"),
+    h("p", { class: "small muted" }, "Every plan starts with a 14-day free trial. Cancel any time before it ends and you won't be charged."),
+    h("div", { class: "plans" }, PLANS.map((p) => h("div", { class: "plan" },
+      h("h3", { style: "margin:0" }, p.name),
+      h("div", { class: "plan-price" }, `$${p.price}`, h("span", { class: "small muted" }, " / month")),
+      h("p", { class: "small muted", style: "margin:4px 0 10px" }, p.for),
+      h("a", { class: "btn", href: p.url, target: "_blank", rel: "noopener" }, "Start free trial")))));
+}
+
 // ---------- working indicator ----------
 // Heavy steps run on this page, so they pause briefly (tick) to let the screen
 // update and scroll, and a bar at the bottom shows what is happening.
@@ -360,7 +377,8 @@ function renderTool(isAdmin) {
       h("p", { class: "muted small" }, "Load a video clip, or several photos of the same vehicle. Nothing is uploaded; processing happens on this device."),
       h("div", { class: "row" }, h("label", {}, "Case number", caseNo), h("label", {}, "Examiner", examiner)),
       h("label", {}, "Footage", file),
-      openBtn, msg)].filter(Boolean));
+      openBtn, msg),
+    plansCard()].filter(Boolean));
   if (isAdmin) { renderAdmin(adminBox); renderTips(tipsBox, start); }
 }
 
