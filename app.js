@@ -1354,4 +1354,469 @@ function printPatternScan(v) {
     if (!flag[i] || seen[i]) continue;
     const stack = [i]; seen[i] = 1; let minx = 1e9, miny = 1e9, maxx = -1, maxy = -1, count = 0;
     while (stack.length) {
-      const k = stack.pop(), x = k % gw, y = (k / gw) | 0; c
+      const k = stack.pop(), x = k % gw, y = (k / gw) | 0; count++;
+      minx = Math.min(minx, x); maxx = Math.max(maxx, x); miny = Math.min(miny, y); maxy = Math.max(maxy, y);
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy, nk = ny * gw + nx;
+        if (nx >= 0 && ny >= 0 && nx < gw && ny < gh && flag[nk] && !seen[nk] && alike(k, nk)) { seen[nk] = 1; stack.push(nk); }
+      }
+    }
+    if (count < Math.max(3, flag.length * 0.004)) continue;
+    if (minx === 0 && miny === 0 && maxx === gw - 1 && maxy === gh - 1) continue;   // the background around the vehicle
+    const pad = cell, box = { x: Math.max(0, minx * cell - pad), y: Math.max(0, miny * cell - pad) };
+    box.w = Math.min(W, (maxx + 1) * cell + pad) - box.x; box.h = Math.min(H, (maxy + 1) * cell + pad) - box.y;
+    let sumDe = 0, n = 0; const acc = [0, 0, 0];
+    for (let y = box.y; y < box.y + box.h; y++) for (let x = box.x; x < box.x + box.w; x++) { const q = y * W + x; if (de[q] > 10) { sumDe += de[q]; n++; acc[0] += corr[q * 3]; acc[1] += corr[q * 3 + 1]; acc[2] += corr[q * 3 + 2]; } }
+    const mean = acc.map((a) => Math.round(a / Math.max(1, n)));
+    const crop = canvasOf(box.w, box.h); crop.getContext("2d").putImageData(img, -box.x, -box.y);
+    areas.push({ box, size_pct: +((count / flag.length) * 100).toFixed(1), difference: +(sumDe / Math.max(1, n)).toFixed(1), color: { rgb: mean, hex: rgbToHex(mean), name: colorName(mean) }, crop, label: "Review" });
+  }
+  areas.sort((a, b) => b.size_pct * b.difference - a.size_pct * a.difference);
+  areas.splice(12);
+  areas.forEach((a, i) => (a.n = i + 1));
+  return { reference_lab: ref.map((x) => +x.toFixed(1)), diff, detail, printC, cells, areas };
+}
+
+function outlinedDiff(scan) {
+  const c = canvasFromData(scan.diff), x = c.getContext("2d"), lw = Math.max(2, c.width / 250);
+  scan.areas.forEach((a) => {
+    x.strokeStyle = "#4fb3ff"; x.lineWidth = lw; x.strokeRect(a.box.x, a.box.y, a.box.w, a.box.h);
+    x.fillStyle = "#4fb3ff"; x.font = `bold ${Math.round(lw * 7)}px sans-serif`; x.textBaseline = "bottom"; x.fillText(String(a.n), a.box.x + 2, a.box.y - 2);
+  });
+  return c;
+}
+
+async function vehicleStep(stage) {
+  const isVideo = C.kind === "video";
+  const used = C.frames.filter((f) => f.use);
+  // reference frame, full size, to mark the back of the vehicle
+  const srcW = isVideo ? C.video.videoWidth : C.images[0].width, srcH = isVideo ? C.video.videoHeight : C.images[0].height;
+  const frameCanvas = canvasOf(srcW, srcH), fctx = frameCanvas.getContext("2d", { willReadFrequently: true });
+  const grab = async (key) => {
+    if (isVideo) { await seekTo(C.video, key); fctx.drawImage(C.video, 0, 0); }
+    else { fctx.clearRect(0, 0, srcW, srcH); fctx.drawImage(C.images[key], 0, 0); }
+  };
+  await grab(isVideo ? C.refTime : 0);
+  const base = h("canvas", { class: "frame", width: srcW, height: srcH }); base.getContext("2d").drawImage(frameCanvas, 0, 0);
+  const overlay = h("canvas", { class: "overlay" });
+  C.vehicle = C.vehicle || { marks: [] };
+  const status = h("p", { class: "small muted" }, "Drag a box around the whole back of the vehicle (bumper, lights, trunk).");
+  const combineBtn = h("button", { disabled: !C.vehicle.box }, "Combine the back of the vehicle");
+  const bar = h("i", {});
+  const work = h("div", {});
+  const draw = attachBoxDrawing(overlay, srcW, srcH, (b) => { C.vehicle.box = b; combineBtn.disabled = !b; });
+  draw(C.vehicle.box || null);
+
+  const combine = async () => {
+    combineBtn.disabled = true;
+    const box = C.vehicle.box, scale = box.w * box.h > 90000 ? 1 : 2;
+    await grab(isVideo ? C.refTime : 0);
+    const ref = grayRegion(fctx, box.x, box.y, box.w, box.h);
+    const imgs = [];
+    for (let i = 0; i < used.length; i++) {
+      await grab(used[i].key);
+      const al = alignTo(ref, box, fctx, srcW, srcH);
+      if (al.match < 0.5) continue;
+      const big = canvasOf(box.w * scale, box.h * scale), bctx = big.getContext("2d", { willReadFrequently: true });
+      bctx.imageSmoothingQuality = "high";
+      bctx.drawImage(frameCanvas, box.x + al.dx, box.y + al.dy, box.w, box.h, 0, 0, big.width, big.height);
+      imgs.push({ img: bctx.getImageData(0, 0, big.width, big.height) });
+      bar.style.width = `${Math.round(((i + 1) / used.length) * 100)}%`;
+    }
+    if (!imgs.length) { status.className = "small error"; status.textContent = "The back of the vehicle didn't line up across frames. Try a tighter box."; combineBtn.disabled = false; return; }
+    C.vehicle.combined = averageFrames(imgs);
+    C.vehicle.frames = imgs.length; C.vehicle.scale = scale; C.vehicle.marks = []; C.vehicle.samples = []; C.vehicle.scan = null; C.vehicle.finish = C.vehicle.finish || "Not sure";
+    logStep("vehicle_combined", { rear_box: box, frames_combined: imgs.length, detail_factor: scale });
+    showDetails();
+    combineBtn.disabled = false;
+  };
+  combineBtn.addEventListener("click", combine);
+
+  const showDetails = () => {
+    const v = C.vehicle, W = v.combined.width, H = v.combined.height;
+    const pic = h("canvas", { class: "frame", width: W, height: H });
+    const over = h("canvas", { class: "overlay" });
+    const mode = h("select", {}, h("option", { value: "paint" }, "Drag a box on paint (add a sample)"), h("option", { value: "mark" }, "Tap to pin a distinguishing mark"));
+    const finish = h("select", { onchange: () => { v.finish = finish.value; logStep("paint_finish", { finish: v.finish }); } }, FINISHES.map((f) => h("option", { selected: f === v.finish }, f)));
+    const markType = h("select", {}, MARK_TYPES.map((t) => h("option", {}, t)));
+    const markNote = h("input", { placeholder: "Short note, e.g. 'round sticker, lower left'" });
+    const paintOut = h("div", {});
+    const list = h("ol", { class: "small" });
+    const repaint = () => { pic.getContext("2d").drawImage(markedRear(), 0, 0); };
+    const showMarks = () => list.replaceChildren(...v.marks.map((m) => h("li", {}, `${m.type}${m.note ? " — " + m.note : ""} `,
+      h("button", { class: "ghost", style: "min-height:28px;padding:2px 8px", onclick: () => { v.marks = v.marks.filter((x) => x !== m).map((x, i) => ({ ...x, n: i + 1 })); logStep("mark_removed", { type: m.type }); repaint(); showMarks(); } }, "Remove"))));
+    const showPaint = () => {
+      const wb = whiteGains();
+      paintOut.replaceChildren(...v.samples.map((sm, i) => h("div", { class: "row", style: "align-items:center;margin-bottom:8px" },
+        h("div", { style: "flex:0 0 40px;font-weight:800;color:#f2b84b" }, sm.label),
+        h("div", {}, h("div", { style: `height:36px;border-radius:8px;background:${sm.raw.hex};border:1px solid var(--line)` }), h("div", { class: "small muted" }, `As recorded ${sm.raw.hex}`)),
+        h("div", {}, h("div", { style: `height:36px;border-radius:8px;background:${sm.corrected.hex};border:1px solid var(--line)` }), h("div", { class: "small" }, `Corrected ${sm.corrected.hex} · `, h("strong", {}, sm.corrected.name))),
+        h("div", { class: "small" }, `Surface: ${sm.evenness.label}`, i ? h("div", { class: sm.flag ? "" : "muted" }, sm.flag ? h("span", { class: "pill warn" }, `${sm.delta} different from A: possible repainted or replaced panel`) : `Matches A (difference ${sm.delta})`) : null),
+        h("button", { class: "ghost", style: "flex:0 0 auto;min-height:28px;padding:2px 8px", onclick: () => { v.samples = v.samples.filter((x) => x !== sm); relabel(); logStep("paint_sample_removed", { label: sm.label }); repaint(); showPaint(); } }, "Remove"))),
+        v.samples.length ? h("p", { class: "small muted" }, `Corrected using the plate's white background as a known white (recorded as ${rgbToHex(wb.reference)}). Night lighting, glare and camera settings still shift colors; names describe the paint, they are not paint codes. A difference over 10 between samples usually shows as a visibly different panel.`)
+          : h("p", { class: "small muted" }, "Drag a box over a flat area of paint, away from lights, glare and shadows. Add more samples on other panels (bumper, trunk, each side) to spot repainted or replaced parts."));
+    };
+    const relabel = () => {
+      v.samples.forEach((sm, i) => {
+        sm.label = String.fromCharCode(65 + i);
+        sm.delta = i ? +deltaE(v.samples[0].corrected.rgb, sm.corrected.rgb).toFixed(1) : 0;
+        sm.flag = i > 0 && sm.delta > 10;
+      });
+      v.paint = v.samples[0] || null;
+    };
+    const measure = (b) => {
+      const raw = medianColor(v.combined, b), wb = whiteGains();
+      const corr = raw.map((c, i) => c * wb.gains[i]).map(Math.round);
+      const sm = { box: b, raw: { rgb: raw, hex: rgbToHex(raw), name: colorName(raw) }, corrected: { rgb: corr, hex: rgbToHex(corr), name: colorName(corr) }, evenness: evenness(v.combined, b), white_reference_from_plate: wb.reference };
+      v.samples.push(sm); relabel();
+      logStep("paint_sample", { label: sm.label, box: b, as_recorded: sm.raw.hex, corrected: sm.corrected.hex, name: sm.corrected.name, surface: sm.evenness, difference_from_A: sm.delta, possible_panel_mismatch: sm.flag });
+      repaint(); showPaint();
+    };
+    // paint box drawing or mark pinning on the combined rear image
+    let start = null;
+    const toImg = (e) => { const r = over.getBoundingClientRect(); return { x: clamp((e.clientX - r.left) / r.width * W, 0, W), y: clamp((e.clientY - r.top) / r.height * H, 0, H) }; };
+    over.addEventListener("pointerdown", (e) => {
+      if (mode.value === "mark") {
+        const p = toImg(e), m = { n: v.marks.length + 1, x: Math.round(p.x), y: Math.round(p.y), type: markType.value, note: markNote.value.trim() };
+        v.marks.push(m); logStep("mark_added", { n: m.n, type: m.type, note: m.note, at_px: [m.x, m.y] });
+        markNote.value = ""; repaint(); showMarks(); return;
+      }
+      over.setPointerCapture(e.pointerId); start = toImg(e);
+    });
+    over.addEventListener("pointerup", (e) => {
+      if (!start || mode.value !== "paint") return;
+      const p = toImg(e), b = { x: Math.round(Math.min(start.x, p.x)), y: Math.round(Math.min(start.y, p.y)), w: Math.round(Math.abs(p.x - start.x)), h: Math.round(Math.abs(p.y - start.y)) };
+      start = null;
+      if (b.w >= 4 && b.h >= 4) measure(b);
+    });
+    repaint(); showMarks(); showPaint();
+    const scanOut = h("div", {});
+    const showScan = () => {
+      const sc = v.scan;
+      if (!sc) return;
+      scanOut.replaceChildren(
+        h("p", { class: "small muted" }, "A camera records only the surface, so this can't see under the paint. It brings out what's faint in the surface: color changes, texture and patterns. Lights, the plate and reflectors will also show up; label them so they're set aside."),
+        h("div", { class: "result-imgs" },
+          h("figure", { style: "margin:0" }, h("img", { src: outlinedDiff(sc).toDataURL(), alt: "Color difference map" }), h("figcaption", { class: "small muted" }, "Color difference map: yellow to red = paint differs from the main body color (lighting-corrected). Numbered boxes = areas that stand out.")),
+          h("figure", { style: "margin:0" }, h("img", { src: canvasFromData(sc.detail).toDataURL(), alt: "Detail map" }), h("figcaption", { class: "small muted" }, "Detail map: fine texture lifted out, showing scratches, dent ripples, stripes, sticker and wrap edges."))),
+        h("h3", {}, "Paint print"),
+        h("img", { src: sc.printC.toDataURL(), alt: "Paint print", style: "width:100%;max-width:420px;image-rendering:pixelated;border-radius:8px" }),
+        h("p", { class: "small muted" }, "The vehicle's corrected colors on an 8 × 4 grid, like a color barcode. Compare it with another case or a suspect vehicle filmed in similar light."),
+        h("h3", {}, `Areas that stand out (${sc.areas.length})`),
+        sc.areas.length ? h("div", { class: "thumbs" }, sc.areas.map((a) => h("figure", {},
+          h("img", { src: a.crop.toDataURL(), alt: `Area ${a.n}` }),
+          h("figcaption", {}, `#${a.n} · ${a.color.name} · ${a.difference} diff · ${a.size_pct}%`,
+            h("select", { style: "margin-top:4px;padding:4px 6px;font-size:12px", onchange: (e) => { a.label = e.target.value; logStep("pattern_area_labeled", { n: a.n, label: a.label }); } },
+              AREA_LABELS.map((l) => h("option", { selected: l === a.label }, l)))))))
+          : h("p", { class: "small muted" }, "No areas stood out from the main body color."));
+    };
+    const scanBtn = h("button", { onclick: async () => {
+      scanBtn.disabled = true; scanBtn.textContent = "Scanning…";
+      await new Promise((r) => setTimeout(r, 30));
+      v.scan = printPatternScan(v);
+      logStep("print_pattern_scan", { reference_lab: v.scan.reference_lab, areas: v.scan.areas.map((a) => ({ n: a.n, box: a.box, color: a.color.hex, difference: a.difference, size_pct: a.size_pct })), paint_print: v.scan.cells.map((c) => c.hex) });
+      showScan(); scanBtn.disabled = false; scanBtn.textContent = "🔍 Run Print & Pattern scan again";
+    } }, v.scan ? "🔍 Run Print & Pattern scan again" : "🔍 Print & Pattern scan");
+    showScan();
+    work.replaceChildren(
+      h("h3", {}, `Back of the vehicle (${v.frames} frames combined)`),
+      h("div", { class: "stage" }, pic, over),
+      h("div", { class: "row", style: "margin-top:8px" }, h("label", {}, "What to do on the picture", mode), h("label", {}, "Mark type", markType), h("label", {}, "Note", markNote)),
+      h("h3", {}, "Paint: color, finish and pattern"),
+      h("label", { style: "max-width:420px" }, "Finish / pattern you can see", finish),
+      paintOut,
+      h("h3", {}, "Print & Pattern"), h("p", { class: "small muted" }, "Tip: take paint sample A on the main body color first; the scan compares everything with it."), scanBtn, scanOut,
+      h("h3", {}, "Distinguishing marks"), list,
+      h("p", { class: "small muted" }, "Coming in stage 2: make, model and year from the vehicle's shape, and matching the color to manufacturer paint codes."));
+  };
+
+  stage.replaceChildren(stepsBar(5), h("h2", {}, "Vehicle details"),
+    h("p", { class: "small muted" }, "The rest of the vehicle can identify it even when the plate can't: paint, stickers, damage, hitches and aftermarket parts."),
+    h("div", { class: "stage" }, base, overlay), status, combineBtn, h("div", { class: "progress" }, bar), work,
+    h("div", { class: "row", style: "margin-top:12px" }, h("button", { onclick: () => packageStep(stage) }, "Next: case package"),
+      h("button", { class: "ghost", onclick: () => readStep(stage) }, "◀ Back to reading")));
+  if (C.vehicle.combined) showDetails();
+}
+
+// ---------- court-ready report (PDF) ----------
+const pdfSafe = (t) => String(t ?? "").replace(/[\u2192]/g, "->").replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/\u2026/g, "...")
+  .replace(/[^\x20-\x7E\u00A0-\u00FF\u2013\u2014\u2022]/g, "?");
+async function buildReportPdf(report, images) {
+  const { PDFDocument, StandardFonts, rgb } = PDFLib;
+  const doc = await PDFDocument.create();
+  doc.setTitle(`PlateTrace examination report, case ${report.case_no}`); doc.setAuthor(pdfSafe(report.examiner)); doc.setCreator(VERSION);
+  const font = await doc.embedFont(StandardFonts.Helvetica), bold = await doc.embedFont(StandardFonts.HelveticaBold), mono = await doc.embedFont(StandardFonts.Courier);
+  const W = 612, H = 792, M = 54, TW = W - 2 * M;
+  let page, y;
+  const newPage = () => { page = doc.addPage([W, H]); y = H - M; };
+  const need = (hgt) => { if (y - hgt < M + 20) newPage(); };
+  const wrap = (text, f, size, width) => {
+    const out = [];
+    pdfSafe(text).split("\n").forEach((para) => {
+      let line = "";
+      para.split(/(\s+)/).forEach((w) => {
+        const t = line + w;
+        if (f.widthOfTextAtSize(t, size) > width && line.trim()) { out.push(line.trimEnd()); line = w.trimStart(); }
+        else line = t;
+        while (f.widthOfTextAtSize(line, size) > width) { let k = line.length - 1; while (k > 1 && f.widthOfTextAtSize(line.slice(0, k), size) > width) k--; out.push(line.slice(0, k)); line = line.slice(k); }
+      });
+      out.push(line.trimEnd());
+    });
+    return out;
+  };
+  const text = (t, { f = font, size = 10, color = rgb(0.1, 0.1, 0.12), indent = 0, gap = 3 } = {}) => {
+    for (const ln of wrap(t, f, size, TW - indent)) { need(size + gap); page.drawText(ln, { x: M + indent, y: y - size, size, font: f, color }); y -= size + gap; }
+  };
+  const heading = (t) => { need(80); y -= 10; page.drawText(pdfSafe(t), { x: M, y: y - 13, size: 13, font: bold, color: rgb(0.05, 0.2, 0.45) }); y -= 18;
+    page.drawLine({ start: { x: M, y }, end: { x: W - M, y }, thickness: 0.6, color: rgb(0.7, 0.75, 0.82) }); y -= 8; };
+  const kv = (k, v) => { need(14); page.drawText(pdfSafe(k), { x: M, y: y - 10, size: 10, font: bold }); const lines = wrap(v, font, 10, TW - 140);
+    lines.forEach((ln, i) => { if (i) need(13); page.drawText(ln, { x: M + 140, y: y - 10, size: 10, font }); y -= 13; }); };
+  const table = (cols, rows, widths, size = 9) => {
+    const row = (cells, f) => {
+      const wrapped = cells.map((c, i) => wrap(c, f === bold ? bold : (cols[i].mono ? mono : font), size, widths[i] - 6));
+      const hgt = Math.max(...wrapped.map((w) => w.length)) * (size + 2) + 4; need(hgt);
+      let x = M; wrapped.forEach((w, i) => { w.forEach((ln, j) => page.drawText(ln, { x: x + 3, y: y - size - 2 - j * (size + 2), size, font: f === bold ? bold : (cols[i].mono ? mono : font) })); x += widths[i]; });
+      y -= hgt; page.drawLine({ start: { x: M, y }, end: { x: M + widths.reduce((a, b) => a + b, 0), y }, thickness: 0.3, color: rgb(0.8, 0.8, 0.85) });
+    };
+    row(cols.map((c) => c.label), bold); rows.forEach((r) => row(r.map(String), font));
+  };
+  const image = async (title, bytes, maxH = 260) => {
+    const img = await doc.embedPng(bytes); const sc = Math.min(TW / img.width, maxH / img.height, 3);
+    const w = img.width * sc, hgt = img.height * sc; need(hgt + 30);
+    page.drawText(pdfSafe(title), { x: M, y: y - 10, size: 10, font: bold }); y -= 16;
+    page.drawImage(img, { x: M, y: y - hgt, width: w, height: hgt }); page.drawRectangle({ x: M, y: y - hgt, width: w, height: hgt, borderWidth: 0.5, borderColor: rgb(0.5, 0.5, 0.55) }); y -= hgt + 12;
+  };
+
+  newPage();
+  page.drawText("PlateTrace Examination Report", { x: M, y: y - 20, size: 20, font: bold, color: rgb(0.05, 0.2, 0.45) }); y -= 30;
+  text("Video and image enhancement and candidate plate reading. Investigative leads only; not an identification.", { size: 10, color: rgb(0.35, 0.35, 0.4) }); y -= 6;
+  kv("Case number", report.case_no); kv("Examiner", report.examiner); kv("Signed-in account", report.user); kv("Agency", report.agency || "-");
+  kv("Report generated", report.generated_at); kv("Tool and version", report.tool);
+
+  heading("1. Summary");
+  const used = report.frames.length, top = report.candidates.slice(0, 3);
+  text(`${report.originals.length} original file(s) were examined. ${used} frame(s) showing the license plate were lined up with each other and averaged into one combined image, which was then sharpened. ` +
+    `The plate reader read ${report.reads.length} versions of the plate (combined and single frames, normal and black/white) and the reads were combined character by character.` +
+    (top.length ? ` The leading candidates are ${top.map((c) => `${c.plate} (${c.agreement}% agreement)`).join(", ")}.` : " No candidate fit the chosen plate layout.") +
+    (report.partial_list && !report.partial_list.error ? ` A partial-plate search list for "${report.partial_list.mask}" contains ${report.partial_list.total.toLocaleString()} possible plates; the top entries are listed in section 5.` : "") +
+    (report.vehicle ? " The back of the vehicle was also combined and its paint and distinguishing marks were documented (section 6)." : ""));
+  const RA = report.recovery_assessment?.combined_image;
+  if (RA) {
+    y -= 4; text(`Recovery check: ${RA.evidence_grade ? "EVIDENCE-GRADE ENHANCEMENT" : "NOT EVIDENCE-GRADE"}. Detail survived the blur: ${RA.signal_present ? "yes" : "no"}. Blur radius ${RA.blur_radius_est ?? "not measurable"} px vs character stroke ${RA.stroke_width_est ?? "not measurable"} px (original pixels). Source type: ${RA.source_type}. Recovery type: ${RA.recovery_type}. Confidence ${Math.round(RA.confidence * 100)}%.`, { size: 10, f: bold });
+    RA.failed_checks.forEach((t) => text("- " + t, { size: 9, indent: 8 }));
+    RA.flags.forEach((t) => text("- " + t, { size: 9, indent: 8 }));
+  }
+
+  heading("2. Original evidence");
+  text("Each original file was fingerprinted with SHA-256 before any processing. The originals were never changed or uploaded; all processing ran on the examiner's own device.", { size: 9 });
+  table([{ label: "File" }, { label: "Size (bytes)" }, { label: "SHA-256", mono: true }], report.originals.map((o) => [o.name, o.bytes.toLocaleString(), o.sha256]), [150, 70, TW - 220], 8);
+  if (report.public_tip?.length) {
+    y -= 4; text("Source: submitted by a member of the public through PlateTrace Camera. Each file was fingerprinted (SHA-256) on the submitter's phone at the moment of capture; the fingerprint below is compared with the file examined here.", { size: 8.5 });
+    table([{ label: "Tip" }, { label: "Captured" }, { label: "Location" }, { label: "Fingerprint matches" }],
+      report.public_tip.map((t, i) => [t.id.slice(0, 8), t.captured_at || "-", t.location ? `${t.location.lat.toFixed(5)}, ${t.location.lng.toFixed(5)} (±${Math.round(t.location.accuracy_m)} m)` : "not shared", report.originals[i] && report.originals[i].sha256 === t.sha256_at_capture ? "yes" : "NO"]), [60, 130, 170, TW - 360], 8);
+    const n = report.public_tip.find((t) => t.note)?.note; if (n) text(`Submitter's note: "${n}"`, { size: 8.5 });
+  }
+
+  if (report.provenance?.length) {
+    y -= 4; text("Provenance (facts read from each file; nothing inferred beyond the stated rule):", { size: 9, f: bold });
+    table([{ label: "File" }, { label: "Format / compression" }, { label: "Resolution" }, { label: "Capture record" }, { label: "Source type (rule)" }],
+      report.provenance.map((p) => [p.file, [p.container, p.compression, p.jpeg_quality_est != null ? `quality ~${p.jpeg_quality_est}` : null, p.codec].filter(Boolean).join(", "), p.width ? `${p.width} x ${p.height}` : "-",
+        p.exif ? Object.entries(p.exif).map(([k, v]) => `${k}: ${v}`).join("; ") : p.platetrace_capture ? `PlateTrace ${p.platetrace_capture.mode || "capture"} ${p.platetrace_capture.at || ""}` : "none", `${p.source_type} (${p.rule})`]), [86, 110, 60, 120, TW - 376], 7.5);
+  }
+  if (RA) {
+    y -= 4; text("Recovery assessment of the combined image:", { size: 9, f: bold });
+    table([{ label: "Field" }, { label: "Value" }], [["recovery_type", RA.recovery_type], ["signal_present", String(RA.signal_present)], ["blur_radius_est", String(RA.blur_radius_est)], ["stroke_width_est", String(RA.stroke_width_est)],
+      ["source_type", RA.source_type], ["confidence", String(RA.confidence)], ["evidence_grade", String(RA.evidence_grade)], ["edge SNR / noise", `${RA.measurements.edge_snr} / ${RA.measurements.noise_sigma}`],
+      ["stacking", RA.stacking ? `${RA.stacking.genuine_frames} genuine of ${RA.stacking.frames_given}; sub-pixel diversity ${RA.stacking.subpixel_shift_diversity}; confidence ${RA.stacking.confidence}` : "-"], ["operations", RA.operations.join("; ") || "none"]], [120, TW - 120], 8);
+    text("Method: " + RA.method, { size: 7.5 });
+    (report.recovery_assessment.generative_outputs || []).forEach((g) => text(`${g.output}: recovery_type=generative, evidence_grade=false. ${g.disclaimer}`, { size: 8 }));
+  }
+
+  heading("3. Method (plain English)");
+  [
+    `Marking: the examiner drew a box around the plate${report.reference_time_s != null ? ` at ${Number(report.reference_time_s).toFixed(2)} s into the video` : ""}.`,
+    "Finding frames: nearby frames were searched for the same plate using normalized cross-correlation (a standard pattern-matching measure). Each frame's sharpness was scored, and blurry or poorly matching frames were left out.",
+    "Lining up: each kept frame was shifted, to a fraction of a pixel, so the plate sits in the same place in every frame. The shifts are listed in the case report.",
+    `Combining: the lined-up frames were enlarged ${report.processing.detail_factor || UP}x and ${report.processing.far_blurry_mode ? "combined with a sharpness-weighted average (far/blurry mode: every frame showing the plate was used; sharper frames counted more, none were dropped for blur)" : "averaged"}. Before combining, each frame was evened out to its own measured white (plate) and black (letters) levels, and pixels blown out by glare or crushed to black in a frame were left out for that frame only${report.processing.no_data_pct != null ? `; ${report.processing.no_data_pct}% of the plate was not recorded well in any frame and is marked red on the coverage map, left as recorded` : ""}. Combining reduces random noise; it cannot create detail that was not recorded.`,
+    ...(report.processing.unblur ? [`Unblur: Richardson-Lucy deconvolution (${report.processing.unblur.blur}, size ${report.processing.unblur.size_px_at_zoom} px at zoom${report.processing.unblur.angle_deg != null ? `, angle ${report.processing.unblur.angle_deg} degrees` : ""}, ${report.processing.unblur.iterations} rounds). This published method mathematically reverses a known blur shape; it does not add or predict detail.`] : []),
+    `Enhancing: contrast stretch and unsharp-mask sharpening (amount ${report.processing.sharpen_amount ?? "-"}) were applied. These are standard, reversible adjustments.`,
+    ...Object.values(report.processing.operation_labels || {}).map((t) => "Limit - " + t),
+    ...(report.processing.unblur ? [`Unblur blur shape: ${report.processing.unblur.kernel_basis}. ${report.processing.unblur.uncertainty}.`] : []),
+    `Reading: open-source optical character recognition (Tesseract) read each version. Characters were combined by weighted vote at each position${report.read_settings?.layouts?.length ? `, then fitted to the layout ${report.read_settings.layouts.join(" / ")}` : ""}; look-alike characters (for example 0/O, 8/B) were only swapped where the layout requires it, and every swap is noted.`,
+    "No generative AI was used on any image. No pixels were invented, painted in or predicted; every image comes only from the recorded pixels. The Match test and Lead list (if run) are model-based hypotheses, labelled generative, and are never evidence.",
+  ].forEach((t) => text("\u2022 " + t, { size: 9.5, indent: 6 }));
+
+  heading("4. Images");
+  for (const [title, bytes, mh] of images) await image(title, bytes, mh);
+
+  heading("5. Plate candidates");
+  text(`Layout: ${report.read_settings?.format || "-"}. Known characters: ${report.read_settings?.mask || "none"}.${report.read_settings?.no_I_O_Q ? " Letters I, O and Q excluded." : ""}`, { size: 9 });
+  if (report.candidates.length) table([{ label: "#" }, { label: "Candidate", mono: true }, { label: "Agreement" }, { label: "Notes" }],
+    report.candidates.map((c, i) => [i + 1, c.plate, c.agreement + "%", c.note || ""]), [24, 100, 66, TW - 190]);
+  else text("No candidate fit the chosen layout.", { size: 9.5 });
+  if (report.partial_list && !report.partial_list.error) {
+    y -= 6; text(`Partial-plate search list for "${report.partial_list.mask}": ${report.partial_list.total.toLocaleString()} possible plates${report.partial_list.complete ? "" : " (top " + report.partial_list.list.length.toLocaleString() + " kept)"}. Top 30 shown; the full list is in partial_plate_list.csv.`, { size: 9 });
+    const pl = report.partial_list.list.slice(0, 30);
+    table([{ label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }, { label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }],
+      Array.from({ length: Math.ceil(pl.length / 2) }, (_, i) => [i + 1, pl[i].plate, pl[i].rank_score, pl[i + 15] ? i + 16 : "", pl[i + 15]?.plate || "", pl[i + 15]?.rank_score ?? ""]), [40, 90, 54, 40, 90, 54]);
+  }
+  if (report.match_test) {
+    const mt = report.match_test;
+    y -= 6; text(`Match test (Texas Classic): ${mt.plate}`, { size: 10, f: bold });
+    text(`Method: ${mt.method}. Character shapes: ${mt.templates}. Fit with the footage ${Math.round(mt.fit * 100)}%, estimated blur ${mt.blur_sigma_px} px. ${mt.rule}`, { size: 8.5 });
+    text(PTIntegrity.DISCLAIMER_GENERATIVE, { size: 8.5, f: bold });
+    table([{ label: "Spot" }, { label: "Result", mono: true }, { label: "Best matches (share)" }, { label: "Stable" }],
+      mt.positions.map((p) => [p.pos, p.result, p.top.map((t) => `${t.ch} ${t.share}%`).join(", "), p.stable]), [36, 50, TW - 140, 54], 8.5);
+  }
+  if (report.lead_list) {
+    const L = report.lead_list;
+    y -= 6; text(`Lead list (Texas Classic): ${L.plausible_total.toLocaleString()} plates could have produced the footage`, { size: 10, f: bold });
+    text(`Method: ${L.method}. ${L.rule} Fit ${Math.round(L.fit * 100)}%. Full ranked list in lead_list.csv.`, { size: 8.5 });
+    text(PTIntegrity.DISCLAIMER_GENERATIVE, { size: 8.5, f: bold });
+    table([{ label: "Spot" }, { label: "Still possible", mono: true }, { label: "Ruled out", mono: true }], L.positions.map((p) => [p.pos, p.kept, p.ruled_out || "none"]), [36, TW / 2 - 18, TW / 2 - 18], 8.5);
+    const t = L.list.slice(0, 30);
+    table([{ label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }, { label: "Rank" }, { label: "Plate", mono: true }, { label: "Score" }],
+      Array.from({ length: Math.ceil(t.length / 2) }, (_, i) => [i + 1, t[i].plate, t[i].rank_score, t[i + 15] ? i + 16 : "", t[i + 15]?.plate || "", t[i + 15]?.rank_score ?? ""]), [40, 90, 54, 40, 90, 54]);
+  }
+  y -= 6; text("All reads (for transparency):", { size: 9, f: bold });
+  table([{ label: "Version read" }, { label: "Text", mono: true }, { label: "Reader confidence" }], report.reads.map((r) => [r.source, r.text || "-", r.conf + "%"]), [220, 140, TW - 360], 8.5);
+
+  if (report.vehicle) {
+    const v = report.vehicle;
+    heading("6. Vehicle details");
+    kv("Rear frames combined", String(v.frames_combined ?? "-")); kv("Paint finish noted", v.paint_finish || "not noted");
+    if (v.paint_samples?.length) table([{ label: "Sample" }, { label: "Color (corrected)" }, { label: "As recorded" }, { label: "Surface" }, { label: "vs A" }],
+      v.paint_samples.map((s) => [s.label, `${s.corrected.name} ${s.corrected.hex}`, s.as_recorded.hex, s.surface?.label || "-", s.difference_from_A != null ? `${s.difference_from_A}${s.possible_panel_mismatch ? " possible mismatched panel" : ""}` : "-"]), [46, 140, 76, 90, TW - 352], 8.5);
+    if (v.marks?.length) { y -= 4; text("Distinguishing marks:", { size: 9, f: bold }); v.marks.forEach((m) => text(`${m.n}. ${m.type}${m.note ? ": " + m.note : ""}`, { size: 9, indent: 8 })); }
+    if (v.print_pattern?.areas?.length) { y -= 4; text("Print & Pattern scan areas (lighting-corrected color difference from the main body color):", { size: 9, f: bold });
+      table([{ label: "Area" }, { label: "Label" }, { label: "Color" }, { label: "Difference" }, { label: "% of rear" }], v.print_pattern.areas.map((a) => [a.n, a.label, `${a.color.name} ${a.color.hex}`, a.difference, a.size_pct]), [40, 150, 130, 70, TW - 390], 8.5); }
+  }
+
+  heading(`${report.vehicle ? 7 : 6}. Step-by-step record`);
+  table([{ label: "Time (UTC)" }, { label: "Step" }, { label: "Details", mono: true }], report.log.map(({ time, step, ...rest }) => [time.replace("T", " ").replace("Z", ""), step, JSON.stringify(rest)]), [110, 90, TW - 200], 7);
+
+  heading(`${report.vehicle ? 8 : 7}. Output files and fingerprints`);
+  table([{ label: "File" }, { label: "SHA-256", mono: true }], report.outputs.map((o) => [o.file, o.sha256]), [190, TW - 190], 7.5);
+
+  heading(`${report.vehicle ? 9 : 8}. Limitations`);
+  ["Candidates are investigative leads, not an identification. Confirm any candidate against the original footage and agency records before acting on it.",
+   "Agreement percentages show how consistently the reads agreed; they are not a statistical probability that the plate is correct.",
+   "Results depend on the recorded detail. If the plate is only a few pixels wide, the true characters may not be recoverable.",
+   "For court use, have a certified forensic video analyst review the original footage and this report.",
+  ].forEach((t) => text("\u2022 " + t, { size: 9.5, indent: 6 }));
+  need(110); y -= 30;
+  const sig = (label, x) => { page.drawLine({ start: { x, y }, end: { x: x + 220, y }, thickness: 0.6 }); page.drawText(label, { x, y: y - 12, size: 8.5, font }); };
+  sig("Examiner signature / date", M); sig("Reviewed by (forensic video analyst) / date", M + 270);
+
+  const pages = doc.getPages();
+  pages.forEach((pg, i) => pg.drawText(pdfSafe(`PlateTrace  |  Case ${report.case_no}  |  Page ${i + 1} of ${pages.length}`), { x: M, y: 28, size: 8, font, color: rgb(0.45, 0.45, 0.5) }));
+  return doc.save();
+}
+
+// ---------- step 6: case package ----------
+function packageStep(stage) {
+  const status = h("p", { class: "small muted" });
+  const build = async () => {
+    go.disabled = true; status.textContent = "Building the case package…";
+    const zip = new JSZip();
+    const manifest = [];
+    const pics = [];
+    const add = async (name, canvas, pdfTitle, maxH) => { const blob = await blobOf(canvas); const buf = await blob.arrayBuffer(); manifest.push({ file: name, sha256: await sha256(buf) }); zip.file(name, buf); if (pdfTitle) pics.push([`${pdfTitle} (${name})`, buf, maxH]); };
+    await add("combined_enhanced.png", canvasFromData(C.combined), "Combined and enhanced plate", 180);
+    await add("combined_raw.png", canvasFromData(C.combinedRaw), "Combined plate, no sharpening", 180);
+    for (const r of C.reflections || []) await add(`reflections/reflection_${r.n}.png`, r.crop, `Possible reflection #${r.n} (${r.view}, ${Math.round(r.match * 100)}% match, frame ${r.at}) - must be confirmed by eye`, 120);
+    if (C.smart) await add("coverage_map.png", canvasFromData(C.smart.map), "Coverage map (green = recorded well in more frames, red = no frame recorded it well)", 120);
+    await add("clearest_single_frame.png", canvasFromData(C.bestEnh), "Clearest single frame, same enhancement", 180);
+    const used = C.frames.filter((f) => f.use);
+    for (let i = 0; i < used.length; i++) await add(`frames/frame_${String(i + 1).padStart(2, "0")}.png`, canvasFromData(used[i].img));
+    if (C.vehicle?.combined) {
+      await add("vehicle_rear_combined.png", canvasFromData(C.vehicle.combined));
+      await add("vehicle_rear_marked.png", markedRear(), "Back of the vehicle with paint samples and numbered marks", 300);
+      if (C.vehicle.scan) {
+        const sc = C.vehicle.scan;
+        await add("print_pattern/color_difference_map.png", outlinedDiff(sc), "Print & Pattern: color difference map", 260);
+        await add("print_pattern/detail_map.png", canvasFromData(sc.detail));
+        await add("print_pattern/paint_print.png", sc.printC);
+        for (const a of sc.areas) await add(`print_pattern/area_${String(a.n).padStart(2, "0")}.png`, a.crop);
+      }
+    }
+    if (C.leads) { const buf = new TextEncoder().encode("rank,plate,relative_score\n" + C.leads.list.map((x, i) => `${i + 1},${x.plate},${x.rank_score}`).join("\n") + "\n"); manifest.push({ file: "lead_list.csv", sha256: await sha256(buf) }); zip.file("lead_list.csv", buf); }
+    if (C.partial && !C.partial.error) { const buf = new TextEncoder().encode(partialCsv(C.partial)); manifest.push({ file: "partial_plate_list.csv", sha256: await sha256(buf) }); zip.file("partial_plate_list.csv", buf); }
+    logStep("package_built", { files: manifest.length + 1 });
+    const report = {
+      tool: VERSION, generated_at: nowIso(), case_no: C.caseNo, examiner: C.examiner, user: S.user.email,
+      agency: S.access?.agency || (S.isAdmin ? "PlateTrace admin" : null),
+      originals: C.files.map((f) => ({ name: f.name, bytes: f.size, type: f.type, sha256: f.sha256 })),
+      plate_box: C.box, reference_time_s: C.refTime ?? null,
+      frames: used.map((f, i) => ({ n: i + 1, at: f.at, shift_px: [f.dx, f.dy], match: f.match, sharpness: f.sharp, weight: f.weight ?? 1 })),
+      provenance: C.provenance || [], source_type: C.sourceType || null,
+      recovery_assessment: C.assess ? { combined_image: C.assess, generative_outputs: [C.match ? { output: "match_test", ...C.match.integrity } : null, C.leads ? { output: "lead_list", ...C.leads.integrity } : null].filter(Boolean) } : null,
+      processing: { ...C.params, alignment: "normalized cross-correlation with sub-pixel parabola fit", combining: "mean of aligned frames" },
+      read_settings: C.readSettings, reads: C.reads, candidates: C.candidates, match_test: C.match || null,
+      public_tip: C.tip || null,
+      reflections: (C.reflections || []).map((r) => ({ n: r.n, frame: r.at, box: r.box, match: r.match, view: r.view, size_vs_plate: r.size_vs_plate, image: `reflections/reflection_${r.n}.png` })),
+      lead_list: C.leads ? { ...C.leads, list: C.leads.list.slice(0, 200), full_list_file: "lead_list.csv" } : null,
+      partial_list: C.partial ? { ...C.partial, list: C.partial.list?.slice(0, 200) || [], full_list_file: C.partial.error ? null : "partial_plate_list.csv" } : null,
+      vehicle: C.vehicle ? { rear_box: C.vehicle.box, frames_combined: C.vehicle.frames, paint_finish: C.vehicle.finish || null,
+        paint_samples: (C.vehicle.samples || []).map((sm) => ({ label: sm.label, box: sm.box, as_recorded: sm.raw, corrected: sm.corrected, surface: sm.evenness, difference_from_A: sm.delta, possible_panel_mismatch: sm.flag })),
+        white_reference_from_plate: C.vehicle.samples?.[0]?.white_reference_from_plate || null, marks: C.vehicle.marks,
+        print_pattern: C.vehicle.scan ? { method: "lighting-corrected CIE76 color difference vs main body color; high-pass detail map; 8x4 median color grid",
+          reference_lab: C.vehicle.scan.reference_lab, paint_print: C.vehicle.scan.cells,
+          areas: C.vehicle.scan.areas.map((a) => ({ n: a.n, box: a.box, label: a.label, color: a.color, difference: a.difference, size_pct: a.size_pct, image: `print_pattern/area_${String(a.n).padStart(2, "0")}.png` })) } : null } : null,
+      outputs: manifest, log: C.log,
+      notice: "Candidates are investigative leads, not identification. Verify against the original footage and agency records. Image enhancement only rescales, averages and deconvolves recorded pixels; no generative AI was used on any image. The Match test and Lead list are model-based hypotheses (recovery_type: generative), carry the generative disclaimer and are never evidence-grade.",
+    };
+    let pdfBytes = null;
+    try {
+      status.textContent = "Writing the court report (PDF)…";
+      const pdfReport = { ...report, partial_list: C.partial || null };
+      pdfBytes = await buildReportPdf(pdfReport, pics);
+      zip.file("PlateTrace_report.pdf", pdfBytes);
+      report.report_pdf = { file: "PlateTrace_report.pdf", sha256: await sha256(pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength)) };
+      lastPdf = pdfBytes;
+    } catch (e) { report.report_pdf = { error: String(e.message || e) }; }
+    zip.file("case_report.json", JSON.stringify(report, null, 2));
+    zip.file("README.txt", [
+      `PlateTrace case package — case ${C.caseNo}`, `Generated ${report.generated_at} by ${C.examiner} (${S.user.email})`, "",
+      "PlateTrace_report.pdf  court-ready report: summary, method in plain English, images, candidates, full step record, fingerprints, signature lines",
+      "case_report.json  every step, setting, frame shift, read and candidate, plus SHA-256 fingerprints",
+      ...(C.partial && !C.partial.error ? [`partial_plate_list.csv  every plate fitting "${C.partial.mask}", ranked (${C.partial.list.length} rows)`] : []),
+      "combined_enhanced.png / combined_raw.png  the lined-up frames averaged together",
+      "clearest_single_frame.png  the sharpest single frame, same enhancement",
+      "frames/  each lined-up frame used",
+      "vehicle_rear_combined.png / vehicle_rear_marked.png  the back of the vehicle, combined, with numbered marks", "",
+      ...(C.vehicle?.samples?.length ? [`Paint finish/pattern: ${C.vehicle.finish || "not noted"}`, ...C.vehicle.samples.map((sm) => `  Sample ${sm.label}: ${sm.corrected.name} ${sm.corrected.hex} (as recorded ${sm.raw.hex}), surface ${sm.evenness.label}${sm.flag ? `, ${sm.delta} different from A: possible repainted/replaced panel` : ""}`)] : []),
+      ...(C.vehicle?.scan ? ["Print & Pattern scan: print_pattern/ (difference map, detail map, paint print, area photos)", ...C.vehicle.scan.areas.map((a) => `  Area ${a.n}: ${a.label}, ${a.color.name} ${a.color.hex}, difference ${a.difference}, ${a.size_pct}% of rear`)] : []),
+      ...(C.vehicle?.marks?.length ? ["Distinguishing marks:", ...C.vehicle.marks.map((m) => `  ${m.n}. ${m.type}${m.note ? " — " + m.note : ""}`)] : []), "",
+      ...(C.assess ? [`Recovery check: signal_present=${C.assess.signal_present}, evidence_grade=${C.assess.evidence_grade}, recovery_type=${C.assess.recovery_type}, source_type=${C.assess.source_type}, blur ${C.assess.blur_radius_est ?? "?"} px vs stroke ${C.assess.stroke_width_est ?? "?"} px, confidence ${Math.round(C.assess.confidence * 100)}%`, ""] : []),
+      "Top candidates:", ...C.candidates.slice(0, 5).map((c, i) => `  ${i + 1}. ${c.plate}  ${c.agreement}%  ${c.note || ""}`), "",
+      "To verify an image: compute its SHA-256 and compare it to case_report.json → outputs.",
+      "Original footage fingerprints are in case_report.json → originals.", "",
+      report.notice,
+    ].join("\n"));
+    const blob = await zip.generateAsync({ type: "blob" });
+    const a = h("a", { href: URL.createObjectURL(blob), download: `PlateTrace_${C.caseNo.replace(/[^\w-]+/g, "_")}_${nowIso().slice(0, 10)}.zip` });
+    document.body.append(a); a.click(); a.remove();
+    await audit("export", { frames: used.length, top: C.candidates.slice(0, 3).map((c) => c.plate) });
+    status.className = "small ok"; status.textContent = "Case package downloaded (includes the PDF report). This export was recorded in the audit log.";
+    if (!pdfBytes) { status.className = "small error"; status.textContent = "Case package downloaded, but the PDF report couldn't be made: " + report.report_pdf.error; }
+    go.disabled = false; pdfBtn.disabled = !pdfBytes;
+  };
+  let lastPdf = null;
+  const pdfBtn = h("button", { class: "ghost", disabled: true, style: "margin-left:8px", onclick: () => {
+    const a = h("a", { href: URL.createObjectURL(new Blob([lastPdf], { type: "application/pdf" })), download: `PlateTrace_${C.caseNo.replace(/[^\w-]+/g, "_")}_report.pdf` });
+    document.body.append(a); a.click(); a.remove(); audit("report_pdf_download", {});
+  } }, "Download the PDF report alone");
+  const go = h("button", { onclick: build }, "Download case package (.zip)");
+  stage.replaceChildren(stepsBar(6), h("h2", {}, "Case package"),
+    h("p", { class: "small muted" }, "One zip with the court-ready PDF report, the enhanced images, every frame used, the candidate list and a full record with SHA-256 fingerprints, ready to hand to your forensic video unit or to load into Amped FIVE or iNPUT-ACE."),
+    h("div", {}, go, pdfBtn), status,
+    h("h3", {}, "Next steps for the investigation"),
+    h("ol", { class: "small" },
+      h("li", {}, "Run the top candidates through your agency's plate-camera network (Flock, Vigilant) with the time, place and vehicle description."),
+      h("li", {}, "For court, have a certified forensic video analyst review the original footage and this package."),
+      h("li", {}, "Keep the original footage unchanged; its SHA-256 is in the report.")),
+    h("button", { class: "ghost", style: "margin-top:8px", onclick: () => vehicleStep(stage) }, "◀ Back to vehicle details"));
+}
+
+boot();
