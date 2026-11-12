@@ -273,7 +273,12 @@ function renderTool(isAdmin) {
   const msg = h("p", { class: "small" });
   const start = async (tip) => {
     if (tip && !caseNo.value.trim()) caseNo.value = `TIP-${tip.rows[0].id.slice(0, 8)}`;
-    if (!caseNo.value.trim() || !examiner.value.trim()) { msg.className = "small error"; msg.textContent = "Enter the case number and examiner name first."; return; }
+    if (!caseNo.value.trim() || !examiner.value.trim()) {
+      msg.className = "small error"; msg.textContent = "Enter the case number and examiner name first.";
+      (examiner.value.trim() ? caseNo : examiner).focus(); (examiner.value.trim() ? caseNo : examiner).scrollIntoView({ block: "center" });
+      if (tip) throw new Error("Type your name in the Examiner box at the top, then tap Open as case again.");
+      return;
+    }
     const files = tip ? tip.files : [...file.files];
     if (!files.length) { msg.className = "small error"; msg.textContent = "Choose a video, or one or more photos."; return; }
     msg.className = "small muted"; msg.textContent = "Fingerprinting the original file (SHA-256)…";
@@ -288,7 +293,7 @@ function renderTool(isAdmin) {
       C.files.forEach((f, i) => { const r = tip.rows[i]; logStep("public_tip", { tip_id: r.id, sha256_at_capture: r.sha256, matches_file: r.sha256 === f.sha256, captured_at: r.captured_at, location: r.lat != null ? `${r.lat.toFixed(6)}, ${r.lng.toFixed(6)} (±${r.accuracy_m} m)` : "not shared" }); });
       if (C.files.some((f, i) => f.sha256 !== tip.rows[i].sha256)) { msg.className = "small error"; msg.textContent = "Warning: a file's fingerprint doesn't match the one taken on the phone. It may have been changed."; }
     }
-    msg.className = "small muted"; msg.textContent = "Reading file facts (provenance)…";
+    if (!msg.classList.contains("error")) { msg.className = "small muted"; msg.textContent = "Reading file facts (provenance)…"; }
     try {
       C.provenance = await PTIntegrity.provenance(C.files, C.tip);
       C.sourceType = PTIntegrity.caseSource(C.provenance);
@@ -1349,8 +1354,4 @@ function printPatternScan(v) {
     if (!flag[i] || seen[i]) continue;
     const stack = [i]; seen[i] = 1; let minx = 1e9, miny = 1e9, maxx = -1, maxy = -1, count = 0;
     while (stack.length) {
-      const k = stack.pop(), x = k % gw, y = (k / gw) | 0; count++;
-      minx = Math.min(minx, x); maxx = Math.max(maxx, x); miny = Math.min(miny, y); maxy = Math.max(maxy, y);
-      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const nx = x + dx, ny = y + dy, nk = ny * gw + nx;
-        if (nx >= 0 && ny >= 0 && nx < gw && ny < gh && flag[nk] 
+      const k = stack.pop(), x = k % gw, y = (k / gw) | 0; c
