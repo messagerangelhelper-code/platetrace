@@ -38,6 +38,27 @@ const PLANS = [
   { name: "Agency", price: 199, for: "Mid-size departments and investigation firms", url: "https://buy.stripe.com/fZu14p0vS4dP40Vba1ak007" },
   { name: "Enterprise", price: 299, for: "Large agencies and multi-unit teams", url: "https://buy.stripe.com/5kQcN70vS6lX9lfdi9ak008" },
 ];
+function planUrl(p) {
+  // Prefill the sign-in email so the subscription is matched to this account.
+  if (!S.user) return p.url;
+  const q = new URLSearchParams({ prefilled_email: String(S.user.email || "").toLowerCase(), client_reference_id: S.user.id });
+  return `${p.url}?${q}`;
+}
+function renderPlansGate() {
+  $app.replaceChildren(
+    h("div", { class: "card" }, h("h1", {}, "Your agency is verified"),
+      h("p", {}, "Pick a plan to start using PlateTrace. Every plan begins with a 14-day free trial."),
+      h("p", { class: "small muted" }, `Use ${S.user.email} at checkout so your plan is linked to this account. After checkout, come back and reload this page.`),
+      h("button", { class: "ghost", onclick: () => route() }, "I've subscribed, check again")),
+    plansCard());
+}
+function planLine() {
+  const b = S.billing;
+  if (!b?.active) return null;
+  const until = (t) => new Date(t * 1000).toLocaleDateString();
+  return h("p", { class: "small muted", style: "margin:6px 0 0" },
+    `Plan: ${b.plan}${b.status === "trialing" && b.trial_end ? ` (free trial until ${until(b.trial_end)})` : ""}${b.cancel_at_period_end && b.period_end ? ` · ends ${until(b.period_end)}` : ""}`);
+}
 function plansCard() {
   return h("div", { class: "card", id: "plans" },
     h("h2", {}, "Plans"),
@@ -46,7 +67,7 @@ function plansCard() {
       h("h3", { style: "margin:0" }, p.name),
       h("div", { class: "plan-price" }, `$${p.price}`, h("span", { class: "small muted" }, " / month")),
       h("p", { class: "small muted", style: "margin:4px 0 10px" }, p.for),
-      h("a", { class: "btn", href: p.url, target: "_blank", rel: "noopener" }, "Start free trial")))));
+      h("a", { class: "btn", href: planUrl(p), target: "_blank", rel: "noopener" }, "Start free trial")))));
 }
 
 // ---------- working indicator ----------
@@ -140,7 +161,15 @@ async function route() {
   const set = await sb.from("platetrace_settings").select("public_mode").eq("id", 1).maybeSingle();
   S.publicMode = !!set.data?.public_mode;
   if (S.isAdmin) return renderTool(true);
-  if (data?.status === "approved") return renderTool(false);
+  if (data?.status === "approved") {
+    // Verified agencies also need an active plan (a 14-day free trial counts).
+    renderMessage("Checking your plan…", "One moment.");
+    const { data: bill, error: billErr } = await sb.functions.invoke("platetrace-billing", { body: {} });
+    S.billing = bill || null;
+    if (bill?.active) return renderTool(false);
+    if (billErr && !bill) return renderMessage("Can't check your plan", "We couldn't reach billing just now. Reload the page in a minute. If it keeps happening, contact PlateTrace.");
+    return renderPlansGate();
+  }
   if (S.publicMode) return renderTool(false);
   if (!data) return renderRequest();
   if (data.status === "rejected") return renderMessage("Access not approved", data.note || "Your request wasn't approved. Contact PlateTrace if you think this is a mistake.");
@@ -373,12 +402,12 @@ function renderTool(isAdmin) {
       h("p", { class: "small muted" }, "Photos and videos sent from PlateTrace Camera (", h("a", { href: "camera/", target: "_blank", style: "color:var(--accent)" }, location.origin + "/camera/"), "). Fingerprinted on the phone when taken."), tipsBox) : null,
     isAdmin ? h("div", { class: "card" }, h("h2", {}, "Access requests"), adminBox) : null,
     h("div", { class: "card" },
-      h("h1", {}, "New case"),
+      h("h1", {}, "New case"), planLine(),
       h("p", { class: "muted small" }, "Load a video clip, or several photos of the same vehicle. Nothing is uploaded; processing happens on this device."),
       h("div", { class: "row" }, h("label", {}, "Case number", caseNo), h("label", {}, "Examiner", examiner)),
       h("label", {}, "Footage", file),
       openBtn, msg),
-    plansCard()].filter(Boolean));
+    S.billing?.active ? null : plansCard()].filter(Boolean));
   if (isAdmin) { renderAdmin(adminBox); renderTips(tipsBox, start); }
 }
 
