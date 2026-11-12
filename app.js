@@ -31,6 +31,32 @@ function h(tag, attrs, ...kids) {
 }
 const nowIso = () => new Date().toISOString();
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// ---------- working indicator ----------
+// Heavy steps run on this page, so they pause briefly (tick) to let the screen
+// update and scroll, and a bar at the bottom shows what is happening.
+const tick = () => new Promise((r) => setTimeout(r, 0));
+let busyEl = null;
+function busy(text, pct) {
+  if (!text) { if (busyEl) busyEl.remove(); busyEl = null; return; }
+  if (!busyEl) {
+    busyEl = h("div", { class: "busy", role: "status", "aria-live": "polite" },
+      h("span", { class: "spin" }), h("span", { class: "busy-text" }), h("div", { class: "busy-bar" }, h("i", {})));
+    document.body.append(busyEl);
+  }
+  busyEl.querySelector(".busy-text").textContent = text;
+  const bar = busyEl.querySelector(".busy-bar");
+  bar.style.display = pct == null ? "none" : "";
+  if (pct != null) bar.firstChild.style.width = `${Math.round(clamp(pct, 0, 1) * 100)}%`;
+}
+// Runs a button's job with the button disabled, its label changed and the bar showing.
+async function working(btn, label, job) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = label; busy(label, null);
+  await tick(); await new Promise((r) => requestAnimationFrame(() => r()));
+  try { return await job(); }
+  finally { busy(null); if (btn.isConnected) { btn.disabled = false; btn.textContent = old; } }
+}
 async function sha256(buf) {
   const d = await crypto.subtle.digest("SHA-256", buf);
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -283,7 +309,11 @@ function renderTool(isAdmin) {
     if (!files.length) { msg.className = "small error"; msg.textContent = "Choose a video, or one or more photos."; return; }
     msg.className = "small muted"; msg.textContent = "Fingerprinting the original file (SHA-256)…";
     C = { caseNo: caseNo.value.trim(), examiner: examiner.value.trim(), files: [], log: [], frames: [], box: null, kind: "", combined: null };
-    for (const f of files) C.files.push({ name: f.name, size: f.size, type: f.type, sha256: await sha256(await f.arrayBuffer()), file: f });
+    for (const [i, f] of files.entries()) {
+      busy(`Opening case: fingerprinting file ${i + 1} of ${files.length} (${f.name})…`, i / files.length); await tick();
+      C.files.push({ name: f.name, size: f.size, type: f.type, sha256: await sha256(await f.arrayBuffer()), file: f });
+    }
+    busy("Opening case: reading file facts…", null); await tick();
     C.fileHash = C.files[0].sha256;
     C.kind = files[0].type.startsWith("video/") ? "video" : "images";
     logStep("case_opened", { case_no: C.caseNo, examiner: C.examiner, user: S.user.email, version: VERSION });
@@ -302,6 +332,7 @@ function renderTool(isAdmin) {
     audit("open", { files: C.files.map((f) => ({ name: f.name, sha256: f.sha256 })) });
     renderWork();
   };
+  const openBtn = h("button", { style: "margin-top:12px", onclick: () => working(openBtn, "Opening case…", () => start()).catch((e) => { msg.className = "small error"; msg.textContent = "Couldn't open the case: " + (e.message || e); }) }, "Open case");
   const adminBox = h("div", {}), tipsBox = h("div", {});
   const switchMsg = h("p", { class: "small muted" });
   const switchBtn = h("button", { class: S.publicMode ? "" : "ghost", onclick: async () => {
@@ -329,7 +360,7 @@ function renderTool(isAdmin) {
       h("p", { class: "muted small" }, "Load a video clip, or several photos of the same vehicle. Nothing is uploaded; processing happens on this device."),
       h("div", { class: "row" }, h("label", {}, "Case number", caseNo), h("label", {}, "Examiner", examiner)),
       h("label", {}, "Footage", file),
-      h("button", { style: "margin-top:12px", onclick: () => start() }, "Open case"), msg)].filter(Boolean));
+      openBtn, msg)].filter(Boolean));
   if (isAdmin) { renderAdmin(adminBox); renderTips(tipsBox, start); }
 }
 
@@ -346,6 +377,8 @@ async function renderWork() {
   const stage = h("div", { class: "card" });
   const logCard = h("div", { class: "card" }, h("h3", { style: "margin-top:0" }, "Evidence log"), h("div", { class: "log", id: "log" }));
   $app.replaceChildren(head, stage, logCard);
+  window.scrollTo({ top: 0 });
+  head.append(h("p", { class: "small", style: "margin:8px 0 0;color:var(--good)" }, `✓ Case opened. ${C.files.length} file(s) fingerprinted. Next: mark the plate below.`));
   logStep("work_started", {});
   if (C.kind === "video") await markOnVideo(stage); else await markOnImages(stage);
 }
@@ -501,7 +534,7 @@ function framesStep(stage) {
   const bar = h("i", {});
   const status = h("p", { class: "small muted" });
   const thumbs = h("div", { class: "thumbs" });
-  const next = h("button", { disabled: true, onclick: () => combineStep(stage) }, "Next: combine the frames");
+  const next = h("button", { disabled: true, onclick: () => working(next, "Combining…", () => combineStep(stage)).catch((e) => { status.className = "small error"; status.textContent = "Combining failed: " + (e.message || e); }) }, "Next: combine the frames");
   const run = async () => {
     go.disabled = true; next.disabled = true; thumbs.replaceChildren();
     const box = C.box;
@@ -528,7 +561,9 @@ function framesStep(stage) {
     await grab(isVideo ? C.refTime : 0);
     const ref = grayRegion(fctx, box.x, box.y, box.w, box.h);
     const found = [];
+    busy(isVideo ? "Finding the clearest frames…" : "Lining up the photos…", 0);
     for (let k = 0; k < times.length; k++) {
+      await tick();
       await grab(times[k]);
       const al = alignTo(ref, box, fctx, srcW, srcH);
       const big = canvasOf(box.w * C.up, box.h * C.up);
@@ -539,7 +574,9 @@ function framesStep(stage) {
       found.push({ key: times[k], at: isVideo ? +times[k].toFixed(3) : C.files[times[k]].name, dx: +al.dx.toFixed(2), dy: +al.dy.toFixed(2), match: +al.match.toFixed(3), sharp: +sharpness(g, box.w, box.h).toFixed(1), img: bctx.getImageData(0, 0, big.width, big.height) });
       bar.style.width = `${Math.round(((k + 1) / times.length) * 100)}%`;
       status.textContent = `Checked ${k + 1} of ${times.length} frames…`;
+      busy(`Checked ${k + 1} of ${times.length} frames…`, (k + 1) / times.length);
     }
+    busy(null);
     // keep frames that really line up with the plate, then the sharpest of those
     // Far / blurry mode: every frame that shows the plate is used; sharper frames simply count more when combined.
     const good = found.filter((f) => f.match >= (C.farMode ? 0.4 : 0.5));
@@ -668,7 +705,7 @@ function enhance(img, amount, gray) {
 // white = white and black = black, and then builds each pixel only from frames where that pixel was
 // recorded well (not blown out by glare, not crushed to black). Pixels no frame recorded well are
 // flagged as "no data" on the coverage map; nothing is painted in.
-function smartCombine(frames) {
+async function smartCombine(frames, onProgress) {
   const w = frames[0].img.width, hgt = frames[0].img.height, n = w * hgt;
   const CLIP = 250, CRUSH = 6;
   const stats = frames.map((f) => {
@@ -695,8 +732,9 @@ function smartCombine(frames) {
     return boxBlur(out, w, hgt, R);
   };
   const acc = new Float32Array(n * 3), wsum = new Float32Array(n), good = new Uint16Array(n), fall = new Float32Array(n * 3), fallW = new Float32Array(n);
-  frames.forEach((f, k) => {
-    const s = stats[k]; if (anyUsable && !s.usable) return;
+  for (const [k, f] of frames.entries()) {
+    if (onProgress) { onProgress(k, frames.length); await tick(); }
+    const s = stats[k]; if (anyUsable && !s.usable) continue;
     const d = f.img.data, gray = new Float32Array(n);
     for (let i = 0, j = 0; i < n; i++, j += 4) gray[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
     const wl = slide(gray, Math.max), bl = slide(gray, Math.min);
@@ -710,7 +748,7 @@ function smartCombine(frames) {
       const wt = s.weight * near * (local ? Math.min(1, ls / 80) : 0.3);
       acc[i * 3] += wt * r; acc[i * 3 + 1] += wt * g; acc[i * 3 + 2] += wt * b; wsum[i] += wt; good[i]++;
     }
-  });
+  }
   const out = new ImageData(w, hgt), map = new ImageData(w, hgt), most = frames.length;
   let nodata = 0;
   for (let i = 0, j = 0; i < n; i++, j += 4) {
@@ -726,9 +764,10 @@ function smartCombine(frames) {
     frames: stats.map((s, k) => ({ n: k + 1, white_level: Math.round(s.white), black_level: Math.round(s.black), blown_out_pct: s.clipped_pct, used: !anyUsable || s.usable, weight: +s.weight.toFixed(3) })) };
 }
 
-function combineStep(stage) {
+async function combineStep(stage) {
   const used = C.frames.filter((f) => f.use);
-  C.smart = smartCombine(used);
+  C.smart = await smartCombine(used, (k, n) => busy(`Combining frame ${k + 1} of ${n}…`, k / n));
+  busy("Measuring the result…", 1); await tick();
   C.combinedRaw = C.smart.img;
   C.best = used[0];
   C.channel = C.channel || "lum";
@@ -806,13 +845,14 @@ function combineStep(stage) {
     const o = ubOpt(); ubBtn.disabled = true;
     if (o.kind === "off") { deblurred = C.combinedRaw; deblurredBest = C.best.img; unblurUsed = null; ubStatus.textContent = "Unblur is off."; }
     else {
-      ubStatus.textContent = "Unblurring… (this can take a few seconds)"; await new Promise((r) => setTimeout(r, 30));
+      ubStatus.textContent = "Unblurring… (this can take a few seconds)"; busy("Unblurring… (this can take a few seconds)", null);
+      await tick(); await new Promise((r) => setTimeout(r, 30));
       const t0 = performance.now();
       deblurred = richardsonLucy(C.combinedRaw, o); deblurredBest = richardsonLucy(C.best.img, o); unblurUsed = o;
       ubStatus.textContent = `Unblur applied in ${((performance.now() - t0) / 1000).toFixed(1)} s. Blur shape ${unblurBasis(o)}. Result is uncertain: compare with the single frame; if edges ring or look doubled, lower the blur size or rounds.`;
       logStep("unblur", { kind: o.kind, size_px_at_zoom: o.size, angle: o.kind === "motion" ? o.angle : null, iterations: o.iterations, kernel_basis: unblurBasis(o) });
     }
-    reassess(); paint(); ubBtn.disabled = false;
+    reassess(); paint(); busy(null); ubBtn.disabled = false;
   };
   const ubBtn = h("button", { class: "ghost", onclick: applyUnblur }, "Apply unblur");
   [ub.kind, ub.size, ub.angle, ub.iter].forEach((el) => el.addEventListener("input", ubLabel));
@@ -842,6 +882,7 @@ function combineStep(stage) {
     h("div", { class: "card", style: "margin-top:12px" }, h("h3", { style: "margin-top:0" }, "Recovery check"),
       h("p", { class: "small muted" }, "Measured on the combined recording before unblur and sharpening, so processing can't make it look better than the footage is. Goes into the report."), assessBox),
     h("div", { style: "margin-top:12px" }, next));
+  stage.scrollIntoView({ block: "start" });
 }
 
 
