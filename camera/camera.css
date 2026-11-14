@@ -74,3 +74,6 @@ button:disabled { opacity: .45; }
 .plancard { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin: 12px 0; }
 .planname { font-weight: 700; font-size: 18px; } .planprice { font-size: 30px; font-weight: 800; margin: 4px 0; }
 .btnlink { display: block; text-align: center; background: var(--accent); color: #04121f; font-weight: 700; text-decoration: none; border-radius: 12px; padding: 13px 18px; margin-top: 10px; }
+.chan select { font: inherit; background: #0d1218; color: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 4px 6px; max-width: 100%; }
+.plate { display: flex; gap: 4px; font: 800 28px/1 ui-monospace, Menlo, monospace; background: #fff; color: #111; border-radius: 8px; padding: 8px 10px; width: max-content; }
+.plate span.q { color: #c33; } .plate i { display: inline-block; width: 10px; }
