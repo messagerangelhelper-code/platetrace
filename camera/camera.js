@@ -14,7 +14,7 @@ let sbP = null;
 function getSb() {
   if (sbP) return sbP;
   sbP = new Promise((res) => {
-    const make = () => (window.supabase ? window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: false } }) : null);
+    const make = () => (window.supabase ? window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, storageKey: "pt-cam-auth", detectSessionInUrl: true } }) : null);
     if (window.supabase) return res(make());
     const el = document.createElement("script"); el.src = SB_LIB; el.async = true;
     el.onload = () => res(make()); el.onerror = () => { sbP = null; res(null); };
@@ -67,7 +67,13 @@ function intro() {
     h("p", { class: "small muted" }, "What you send: the photo or video, the time, and your location if you allow it. Sending is anonymous unless you choose to add contact details. Only PlateTrace staff can see what you send."),
     h("button", { style: "width:100%;margin-top:8px", onclick: () => { askMotion(); store.set("pt_cam_seen", "1"); startCamera(); } }, "Open the camera"),
     introVoice(),
-    h("p", { class: "small muted", style: "margin-top:14px" }, "Tip: add this page to your home screen to use it like an app."))));
+    h("p", { class: "small muted", style: "margin-top:14px" }, "Tip: add this page to your home screen to use it like an app."),
+    accountLine())));
+}
+function accountLine() {
+  const p = getPass(); if (!p) return null;
+  const trial = p.status === "trialing" && p.trial_end ? ` · free trial until ${new Date(p.trial_end * 1000).toLocaleDateString()}` : "";
+  return h("p", { class: "small muted", style: "margin-top:14px" }, `${p.email} · ${p.plan}${trial} `, h("a", { href: "#", style: "color:var(--accent)", onclick: (e) => { e.preventDefault(); signOut(); } }, "Sign out"));
 }
 
 // Hands-free start: listen for "camera activate", then open the camera and start recording.
@@ -768,6 +774,114 @@ function channelPanel(blob) {
     view: () => ({ view, boost: +boost.value, highest_contrast: best, letter_level: ink0, background_level: bg0, blur_gray_pct: blurPct }) };
 }
 
+// ---------- account & monthly plan ($2.99/month, 3-day free trial) ----------
+// The camera opens instantly when the phone already has a recent plan check saved; the plan is
+// re-checked quietly in the background. Without one, the person signs in and the plan is checked first.
+const PLAN_URL = "https://buy.stripe.com/7sY7sNceAfWx54Z7XPak00d";
+const PASS_KEY = "pt_cam_pass", DAY = 864e5;
+const getPass = () => { try { return JSON.parse(store.get(PASS_KEY) || "null"); } catch { return null; } };
+const passOk = () => { const p = getPass(); return p && p.until > Date.now() ? p : null; };
+
+async function checkPlan() {
+  const sb = await getSb();
+  if (!sb) return { offline: true };
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) return { signin: true };
+  const { data, error } = await sb.functions.invoke("platetrace-billing", { body: {} });
+  if (data?.camera) {
+    const c = data.camera;
+    store.set(PASS_KEY, JSON.stringify({ until: Date.now() + DAY, checked: Date.now(), plan: c.plan, status: c.status, trial_end: c.trial_end || null, email: session.user.email }));
+    return { ok: true };
+  }
+  if (error && !data) return { offline: true };
+  store.set(PASS_KEY, "");
+  return { plans: true, email: session.user.email, id: session.user.id };
+}
+
+function screen(...kids) { $app.replaceChildren(h("div", { class: "screen" }, h("div", { class: "intro" }, ...kids))); }
+const go = () => (store.get("pt_cam_seen") ? startCamera() : intro());
+
+async function gate() {
+  screen(h("h1", {}, "Plate", h("span", {}, "Trace"), " Camera"), h("p", { class: "muted" }, "Checking your plan…"));
+  const r = await checkPlan();
+  if (r.ok) return go();
+  if (r.signin) return signIn();
+  if (r.plans) return plansScreen(r);
+  const p = getPass();                                      // no signal: allow a recent subscriber for up to 7 days
+  if (p?.checked && Date.now() - p.checked < 7 * DAY) return go();
+  screen(h("h1", {}, "No connection"), h("p", {}, "PT Camera needs the internet to check your plan. Connect and try again."), h("button", { style: "width:100%", onclick: gate }, "Try again"));
+}
+
+function signIn(msgText) {
+  let creating = false;
+  const email = h("input", { type: "email", placeholder: "Email", autocomplete: "email", class: "field" });
+  const pass = h("input", { type: "password", placeholder: "Password (8+ characters)", autocomplete: "current-password", class: "field" });
+  const msg = h("p", { class: "small" }, msgText || "");
+  const title = h("h1", {}, "Sign in");
+  const mainBtn = h("button", { style: "width:100%;margin-top:10px" }, "Sign in");
+  const swap = h("button", { class: "ghost", style: "width:100%;margin-top:10px" }, "New here? Create an account");
+  const forgot = h("button", { class: "ghost", style: "width:100%;margin-top:10px" }, "Forgot password");
+  swap.onclick = () => { creating = !creating; title.textContent = creating ? "Create your account" : "Sign in"; mainBtn.textContent = creating ? "Create account" : "Sign in";
+    swap.textContent = creating ? "Have an account? Sign in" : "New here? Create an account"; pass.autocomplete = creating ? "new-password" : "current-password"; msg.textContent = ""; };
+  mainBtn.onclick = async () => {
+    const e = email.value.trim(), pw = pass.value;
+    if (!e || pw.length < 8) { msg.className = "small err"; msg.textContent = "Enter your email and a password of 8 or more characters."; return; }
+    mainBtn.disabled = true; msg.className = "small muted"; msg.textContent = creating ? "Creating your account…" : "Signing in…";
+    const sb = await getSb();
+    if (!sb) { mainBtn.disabled = false; msg.className = "small err"; msg.textContent = "No connection. Try again when you have signal."; return; }
+    const res = creating ? await sb.auth.signUp({ email: e, password: pw, options: { emailRedirectTo: location.href.split("#")[0] } }) : await sb.auth.signInWithPassword({ email: e, password: pw });
+    mainBtn.disabled = false;
+    if (res.error) { msg.className = "small err"; msg.textContent = res.error.message; return; }
+    if (!res.data.session) { msg.className = "small ok"; msg.textContent = "Check your email and tap the link to confirm your account, then come back and sign in."; return; }
+    gate();
+  };
+  forgot.onclick = async () => {
+    const e = email.value.trim();
+    if (!e) { msg.className = "small err"; msg.textContent = "Type your email first."; return; }
+    const sb = await getSb(); if (!sb) return;
+    const { error } = await sb.auth.resetPasswordForEmail(e, { redirectTo: location.href.split("#")[0] });
+    msg.className = error ? "small err" : "small ok"; msg.textContent = error ? error.message : "Check your email for a link to set a new password.";
+  };
+  screen(title, h("p", { class: "muted" }, "PT Camera is $2.99 a month with a 3-day free trial. Sign in or create an account to start."), email, pass, mainBtn, msg, swap, forgot);
+}
+
+function newPassword() {
+  const pass = h("input", { type: "password", placeholder: "New password (8+ characters)", autocomplete: "new-password", class: "field" }), msg = h("p", { class: "small" });
+  screen(h("h1", {}, "Set a new password"), pass, h("button", { style: "width:100%;margin-top:10px", onclick: async () => {
+    if (pass.value.length < 8) { msg.className = "small err"; msg.textContent = "Use 8 or more characters."; return; }
+    const { error } = await (await getSb()).auth.updateUser({ password: pass.value });
+    if (error) { msg.className = "small err"; msg.textContent = error.message; } else gate();
+  } }, "Save password"), msg);
+}
+
+function plansScreen(r) {
+  const q = new URLSearchParams({ prefilled_email: String(r.email || "").toLowerCase(), client_reference_id: r.id || "" });
+  screen(h("h1", {}, "Start your free trial"),
+    h("div", { class: "plancard" },
+      h("div", { class: "planname" }, "PT Camera"),
+      h("div", { class: "planprice" }, "$2.99", h("span", { class: "small muted" }, " / month")),
+      h("ul", {}, h("li", {}, "Smart burst: First Shot + bonus rounds, sharpest 3 on top"), h("li", {}, "Color channels, Ink map and Blur gray"),
+        h("li", {}, "Special light modes and anti-glare"), h("li", {}, "Send photos and videos to PlateTrace, fingerprinted")),
+      h("p", { class: "small muted" }, "3 days free, then $2.99 a month plus any sales tax. Cancel any time before the trial ends and you won't be charged."),
+      h("a", { class: "btnlink", href: `${PLAN_URL}?${q}`, target: "_blank", rel: "noopener" }, "Start 3-day free trial")),
+    h("p", { class: "small muted" }, `Use ${r.email} at checkout so your plan is linked to this account.`),
+    h("button", { class: "ghost", style: "width:100%;margin-top:10px", onclick: gate }, "I've subscribed, check again"),
+    h("button", { class: "ghost", style: "width:100%;margin-top:10px", onclick: signOut }, "Sign out"));
+}
+
+async function signOut() { stopVoice(); stopCamera(); store.set(PASS_KEY, ""); const sb = await getSb(); await sb?.auth.signOut().catch(() => {}); signIn(); }
+
+function boot() {
+  if (/type=recovery/.test(location.hash)) {                // came back from a "set a new password" email
+    getSb().then((sb) => sb && sb.auth.onAuthStateChange((ev) => { if (ev === "PASSWORD_RECOVERY") newPassword(); }));
+    return screen(h("p", { class: "muted" }, "One moment…"));
+  }
+  if (passOk()) {
+    go();
+    setTimeout(() => checkPlan().catch(() => {}), 4000);    // refresh quietly; a lapsed plan is caught on the next open
+  } else gate();
+}
+
 // ---------- start ----------
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
-if (store.get("pt_cam_seen")) startCamera(); else intro();
+boot();
