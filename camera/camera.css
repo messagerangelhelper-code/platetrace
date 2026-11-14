@@ -70,3 +70,7 @@ button:disabled { opacity: .45; }
 .chan .views button.sel { background: #fff; color: #000; }
 .chan .row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
 .chan .row input { flex: 1; }
+.field { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: #0d1218; color: var(--text); font: inherit; margin-top: 10px; }
+.plancard { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin: 12px 0; }
+.planname { font-weight: 700; font-size: 18px; } .planprice { font-size: 30px; font-weight: 800; margin: 4px 0; }
+.btnlink { display: block; text-align: center; background: var(--accent); color: #04121f; font-weight: 700; text-decoration: none; border-radius: 12px; padding: 13px 18px; margin-top: 10px; }
