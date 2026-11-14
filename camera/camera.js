@@ -67,6 +67,7 @@ function intro() {
     h("p", { class: "small muted" }, "What you send: the photo or video, the time, and your location if you allow it. Sending is anonymous unless you choose to add contact details. Only PlateTrace staff can see what you send."),
     h("button", { style: "width:100%;margin-top:8px", onclick: () => { askMotion(); store.set("pt_cam_seen", "1"); startCamera(); } }, "Open the camera"),
     introVoice(),
+    h("div", { style: "margin-top:10px" }, uploadButton(false)),
     h("p", { class: "small muted", style: "margin-top:14px" }, "Tip: add this page to your home screen to use it like an app."),
     accountLine())));
 }
@@ -179,6 +180,7 @@ function viewfinder() {
     const has = (...w) => w.some((x) => said.includes(x));
     if (has("camera activate", "activate camera", "camera active")) { pick("video"); if (!recorder) shutter.click(); flash("🎤 Camera activated: recording. Say \"camera stop\" to finish."); return; }
     if (has("burst")) { pick("burst"); shutter.click(); }
+    else if (has("night")) { pick("night"); shutter.click(); }
     else if (has("record", "video", "start")) { pick("video"); if (!recorder) shutter.click(); }
     else if (has("stop", "cut")) { if (recorder) recorder.stop(); }
     else if (has("photo", "picture", "snap", "capture", "shoot", "cheese")) { pick("photo"); shutter.click(); }
@@ -207,12 +209,12 @@ function viewfinder() {
 
   const shutter = h("button", { class: "shutter", "aria-label": "Take photo" });
   const left = h("div", { class: "side" }), right = h("div", { class: "side" });
-  const MODES = ["photo", "burst", "video", "special"];
+  const MODES = ["photo", "burst", "night", "video", "special"];
   const pick = (m) => { if (recorder || mode === m) return; mode = m; modeBtns.forEach((b, i) => (b.className = MODES[i] === m ? "sel" : "")); paintShutter(); };
-  const modeBtns = MODES.map((m) => h("button", { class: m === mode ? "sel" : "", onclick: () => pick(m) }, { photo: "Photo", burst: "Smart burst", video: "Video", special: "Special light" }[m]));
+  const modeBtns = MODES.map((m) => h("button", { class: m === mode ? "sel" : "", onclick: () => pick(m) }, { photo: "Photo", burst: "Smart burst", night: "Night", video: "Video", special: "Special light" }[m]));
   const special = specialPanel(() => paintShutter());
   const paintShutter = () => { shutter.className = mode === "video" ? "shutter rec" : "shutter"; shutter.setAttribute("aria-label", mode === "video" ? "Start recording" : "Take photo");
-    left.textContent = mode === "burst" ? "First Shot + bonus rounds" : mode === "video" ? `up to ${MAX_VIDEO_S}s` : mode === "special" ? `${SPECIAL[specialMode].frames} lossless frames` : "";
+    left.textContent = mode === "burst" ? "First Shot + bonus rounds" : mode === "night" ? "16 frames, stacked" : mode === "video" ? `up to ${MAX_VIDEO_S}s` : mode === "special" ? `${SPECIAL[specialMode].frames} lossless frames` : "";
     special.el.style.display = mode === "special" ? "" : "none"; };
   paintShutter();
 
@@ -230,7 +232,7 @@ function viewfinder() {
     }
     busy = true;
     try {
-      if (mode === "burst") { const shots = await smartBurst(video, (t) => (status.textContent = t)); status.textContent = ""; review(shots); }
+      if (mode === "burst" || mode === "night") { const shots = await smartBurst(video, (t) => (status.textContent = t), { night: mode === "night" }); status.textContent = ""; review(shots, { autoClear: mode === "night" }); }
       else { const shot = await takePhoto(video); status.textContent = ""; review([shot]); }
     } catch (e) { status.textContent = "Couldn't take the photo: " + (e.message || e); if (!watchTimer) startWatch(video, guide); }
     busy = false;
@@ -243,7 +245,9 @@ function viewfinder() {
   (window.requestIdleCallback || ((f) => setTimeout(f, 2500)))(() => getSb());
   if (resumeVoice && voiceBtn) { resumeVoice = false; setTimeout(startVoice, 300); }
   if (activateOnOpen) { activateOnOpen = false; setTimeout(() => { pick("video"); if (!recorder) shutter.click(); flash("🎤 Camera activated: recording. Say \"camera stop\" to finish."); }, 600); }
-  view.append(h("div", { class: "topbar" }, voiceBtn, glareBtn, torchBtn, closeBtn),
+  const lockBtn = h("button", { class: lockOn ? "ghost on" : "ghost", onclick: () => { lockOn = !lockOn; store.set("pt_cam_lock", lockOn ? "1" : "0"); lockBtn.className = lockOn ? "ghost on" : "ghost";
+    if (!lockOn) { curBox = { ...DEF_BOX }; lockSeen = 0; guide.style.cssText = ""; } flash(lockOn ? "Plate lock on: the box finds and follows the plate" : "Plate lock off"); } }, "Plate lock");
+  view.append(h("div", { class: "topbar" }, voiceBtn, lockBtn, glareBtn, torchBtn, uploadButton(true), closeBtn),
     h("div", { class: "bottombar" }, special.el, zoomRow, h("div", { class: "modes" }, modeBtns), h("div", { class: "shutterrow" }, left, shutter, right)));
 }
 
@@ -518,17 +522,28 @@ async function switchCamera(deviceId) {
 }
 
 // ---------- review & send ----------
-function review(shots) {
+function review(shots, opt = {}) {
   stopWatch();
   const wasVoice = voiceOn; stopVoice(); resumeVoice = wasVoice;
-  const isVideo = shots[0].kind === "video";
+  const isVideo = shots.every((s) => s.kind === "video");
   const urls = shots.map((s) => URL.createObjectURL(s.blob));
-  const smart = shots.some((s) => s.smart);
-  const chan = !isVideo && !shots[0].special ? channelPanel(smart ? shots.find((s) => s.smart.rank === 1).blob : shots[0].blob) : null;
-  const media = isVideo ? h("video", { class: "media", src: urls[0], controls: true, playsinline: true })
-    : smart ? smartReview(shots, urls)
-    : shots.length === 1 ? h("img", { class: "media", src: urls[0], alt: "Your photo" })
-    : h("div", { class: "grid" }, urls.map((u) => h("img", { src: u, alt: "Burst photo" })));
+  const photos = shots.filter((s) => s.kind === "photo" && !s.special), pUrls = photos.map((s) => urls[shots.indexOf(s)]);
+  const vids = shots.filter((s) => s.kind === "video");
+  const smart = photos.some((s) => s.smart);
+  const bestPhoto = smart ? photos.find((s) => s.smart.rank === 1) || photos[0] : photos[0];
+  const chan = bestPhoto && !shots[0].special ? channelPanel(bestPhoto.blob) : null;
+  const clear = bestPhoto && !shots[0].special ? clearerPanel(shots, photos, opt.autoClear) : null;
+  const pickBtn = isVideo ? h("button", { class: "ghost", style: "width:100%;margin-top:10px", onclick: async () => {
+    pickBtn.disabled = true;
+    try { const frames = await pickVideoFrames(vids[0], (t) => (pickBtn.textContent = t)); urls.forEach((u) => URL.revokeObjectURL(u)); clearInterval(locTimer); review([...vids, ...frames]); }
+    catch (e) { pickBtn.disabled = false; pickBtn.textContent = "Couldn't read the video: " + (e.message || e); }
+  } }, "Find the sharpest frames in this video") : null;
+  const media = h("div", {},
+    vids.map((v) => h("video", { class: "media", src: urls[shots.indexOf(v)], controls: true, playsinline: true, style: "margin-bottom:10px" })),
+    !photos.length ? null : smart ? smartReview(photos, pUrls)
+      : photos.length === 1 ? h("img", { class: "media", src: pUrls[0], alt: "Your photo" })
+      : h("div", { class: "grid" }, pUrls.map((u) => h("img", { src: u, alt: "Burst photo" }))),
+    shots[0].special ? h("div", { class: "grid" }, urls.map((u) => h("img", { src: u, alt: "Special light frame" }))) : null, pickBtn);
   const note = h("textarea", { rows: 3, maxlength: 1000, placeholder: "What happened, vehicle color/make, direction it went… (optional)" });
   const anon = h("input", { type: "checkbox", checked: true });
   const contact = h("input", { type: "text", maxlength: 200, placeholder: "Name and phone or email (optional)" });
@@ -549,7 +564,7 @@ function review(shots) {
     const group = uuid();
     try {
       for (let i = 0; i < shots.length; i++) {
-        const s = shots[i], ext = s.mime.includes("mp4") ? "mp4" : s.mime.includes("webm") ? "webm" : s.mime.includes("png") ? "png" : "jpg";
+        const s = shots[i], ext = s.ext || (s.mime.includes("mp4") ? "mp4" : s.mime.includes("webm") ? "webm" : s.mime.includes("quicktime") ? "mov" : s.mime.includes("png") ? "png" : "jpg");
         const day = s.at.toISOString().slice(0, 10), path = `${day}/${group}_${i + 1}.${ext}`;
         const up = await sb.storage.from(BUCKET).upload(path, s.blob, { contentType: s.mime, upsert: false });
         if (up.error) throw up.error;
@@ -560,7 +575,7 @@ function review(shots) {
           device: navigator.userAgent.slice(0, 400),
           camera_settings: { group, shot: i + 1, of: shots.length, mode: s.special ? "special" : shots.length > 1 ? "burst" : s.kind, smart_burst: s.smart || null, suggested_view: chan ? chan.view() : null, anti_glare: antiGlare,
             capture_mode: s.special ? SPECIAL[s.special.mode].label : null, special: s.special || null,
-            source_type: s.special ? (s.special.role === "original" ? "raw_capture" : "derivative") : s.kind === "video" ? "video_frame" : "processed_image", zoom: track?.getSettings?.().zoom ?? null,
+            source_type: s.source_type || (s.special ? (s.special.role === "original" ? "raw_capture" : "derivative") : s.kind === "video" ? "video_frame" : "processed_image"), uploaded: s.uploaded || null, clearer_copy: s.clearer || null, zoom: track?.getSettings?.().zoom ?? null,
             width: track?.getSettings?.().width ?? null, height: track?.getSettings?.().height ?? null, seconds: s.seconds ?? null, location_time: loc ? new Date(loc.at).toISOString() : null },
         };
         const ins = await sb.from("platetrace_tips").insert(row);
@@ -577,14 +592,14 @@ function review(shots) {
     }
   };
   const sendBtn = h("button", { onclick: send }, "Send to PlateTrace");
-  const retake = h("button", { class: "ghost", onclick: () => { clearInterval(locTimer); urls.forEach((u) => URL.revokeObjectURL(u)); viewfinder(); } }, "Retake");
+  const retake = h("button", { class: "ghost", onclick: () => { clearInterval(locTimer); urls.forEach((u) => URL.revokeObjectURL(u)); stream ? viewfinder() : startCamera(); } }, "Retake");
   const save = h("button", { class: "ghost", onclick: () => shots.forEach((s, i) => { const a = h("a", { href: urls[i], download: `platetrace_${s.at.toISOString().replace(/[:.]/g, "-")}_${i + 1}${s.special ? "_" + s.special.role : ""}.${s.kind === "video" ? (s.mime.includes("mp4") ? "mp4" : "webm") : s.mime.includes("png") ? "png" : "jpg"}` }); document.body.append(a); a.click(); a.remove(); }) }, "Save to phone");
 
   $app.replaceChildren(h("div", { class: "screen" }, h("div", { class: "review" },
-    h("h2", { style: "margin:4px 0 10px" }, isVideo ? "Your video" : smart ? `Smart burst: ${shots.length} frames, sharpest 3 on top` : shots[0].special ? `${SPECIAL[shots[0].special.mode].label}: ${shots.length - 1} originals + 1 result` : shots.length > 1 ? `Your ${shots.length} photos` : "Your photo"),
+    h("h2", { style: "margin:4px 0 10px" }, isVideo ? (shots[0].uploaded ? "Your clip" : "Your video") : vids.length && smart ? `Video + ${photos.length} sharpest frames` : smart ? `${photos[0].smart.night ? "Night" : "Smart burst"}: ${shots.length} frames, sharpest 3 on top` : shots[0].special ? `${SPECIAL[shots[0].special.mode].label}: ${shots.length - 1} originals + 1 result` : shots.length > 1 ? `Your ${shots.length} photos` : "Your photo"),
     shots[0].special ? h("p", { class: "kv" }, `Result: ${shots[shots.length - 1].special.method}. The originals are sent too; they are the evidence.`) : null,
-    media, chan?.el,
-    h("p", { class: "kv" }, `Taken ${shots[0].at.toLocaleString()} · ${(size / 1048576).toFixed(1)} MB`),
+    media, clear?.el, chan?.el,
+    h("p", { class: "kv" }, `${shots[0].uploaded ? "Uploaded" : "Taken"} ${shots[0].at.toLocaleString()} · ${(size / 1048576).toFixed(1)} MB`),
     h("p", { class: "kv" }, `Fingerprint: ${shots[0].sha256.slice(0, 16)}…`),
     h("label", { class: "check" }, useLoc, h("span", {}, "Include where this was taken ", locText)),
     h("label", {}, "Anything investigators should know?"), note,
@@ -598,7 +613,7 @@ function done(shots) {
     h("h1", { class: "ok" }, "Sent. Thank you."),
     h("p", {}, `PlateTrace received your ${shots[0].kind === "video" ? "video" : shots.length > 1 ? shots.length + " photos" : "photo"}. Each file was fingerprinted when you took it, so investigators can show it wasn't changed.`),
     h("p", { class: "small muted" }, "Keep your original on your phone too, in case investigators ask for it."),
-    h("button", { style: "width:100%", onclick: viewfinder }, "Take another"))));
+    h("button", { style: "width:100%", onclick: () => (stream ? viewfinder() : startCamera()) }, "Take another"))));
 }
 
 // ---------- Smart burst: First Shot + Bonus Rounds ----------
@@ -623,8 +638,10 @@ const isSteady = () => (sensorLive() ? rot < 10 : lastMove < 3.5);   // degrees/
 // Sharpness of the plate area (center of the view): how strongly edges stand out (variance of the Laplacian).
 const MW = 480, MH = 136, mc = document.createElement("canvas"); mc.width = MW; mc.height = MH;
 const mctx = mc.getContext("2d", { willReadFrequently: true });
-function measure(src, w, hgt) {
-  mctx.drawImage(src, w * 0.25, hgt * 0.32, w * 0.5, hgt * 0.26, 0, 0, MW, MH);
+const DEF_BOX = { x: 0.25, y: 0.32, w: 0.5, h: 0.26 };
+let curBox = { ...DEF_BOX }, lockOn = store.get("pt_cam_lock") !== "0", lockSeen = 0;
+function measure(src, w, hgt, box = curBox) {
+  mctx.drawImage(src, w * box.x, hgt * box.y, w * box.w, hgt * box.h, 0, 0, MW, MH);
   const d = mctx.getImageData(0, 0, MW, MH).data, g = new Float32Array(MW * MH);
   for (let i = 0; i < g.length; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
   let s = 0, s2 = 0, n = 0;
@@ -641,15 +658,18 @@ async function grabFrame(video, role, extra) {
   const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.92));
   c.width = c.height = 0;                  // free the memory right away
   return { kind: "photo", blob, at, sha256: await sha256(blob), mime: "image/jpeg",
-    smart: { role, sharpness: Math.round(m.sharp), steady, motion: sensorLive() ? `${rot.toFixed(1)}°/s (motion sensor)` : `${lastMove.toFixed(1)} (picture movement)`, ...extra } };
+    smart: { role, sharpness: Math.round(m.sharp), steady, box: { ...curBox }, plate_lock: lockOn && performance.now() - lockSeen < 1500, motion: sensorLive() ? `${rot.toFixed(1)}°/s (motion sensor)` : `${lastMove.toFixed(1)} (picture movement)`, ...extra } };
 }
 
 function startWatch(video, guide) {
-  stopWatch(); prevGray = null; firstShot = null; preroll = [];
+  stopWatch(); prevGray = null; firstShot = null; preroll = []; curBox = { ...DEF_BOX }; lockSeen = 0;
   watchTimer = setInterval(async () => {
     if (!video.videoWidth || grabbing) return;
+    if (lockOn) trackPlate(video, guide);
     const m = measure(video, video.videoWidth, video.videoHeight); lastMove = m.move;
-    const st = isSteady(); guide.classList.toggle("steady", st); guide.dataset.label = st ? "Steady ✓ good moment" : "Fit the plate here";
+    const locked = lockOn && performance.now() - lockSeen < 1500;
+    const st = isSteady(); guide.classList.toggle("steady", st);
+    guide.dataset.label = st ? "Steady ✓ good moment" : locked ? "Plate locked" : "Fit the plate here";
     const now = Date.now();
     preroll = preroll.filter((p) => now - p.at < PREROLL_MAX_AGE);
     const worst = preroll.length < PREROLL_KEEP ? -1 : Math.min(...preroll.map((p) => p.smart.sharpness));
@@ -662,17 +682,60 @@ function startWatch(video, guide) {
     }
   }, 120);
 }
+// ---------- Plate lock: find the plate in the picture and keep the box on it ----------
+// A plate is a small area packed with sharp up-and-down edges (the letter strokes). Each tick the camera
+// looks for the 2:1 box with the most of those edges; the box follows it, and sharpness is scored there.
+const LW = 192, lc = document.createElement("canvas"), lctx = lc.getContext("2d", { willReadFrequently: true });
+function findPlate(src, vw, vh) {
+  const LH = Math.max(40, Math.round((LW * vh) / vw)); lc.width = LW; lc.height = LH;
+  lctx.drawImage(src, 0, 0, LW, LH);
+  const d = lctx.getImageData(0, 0, LW, LH).data, g = new Float32Array(LW * LH);
+  for (let i = 0; i < g.length; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  const I = new Float32Array((LW + 1) * (LH + 1)); let tot = 0;
+  for (let y = 0; y < LH; y++) { let row = 0;
+    for (let x = 0; x < LW; x++) { const e = x > 0 && x < LW - 1 && Math.abs(g[y * LW + x + 1] - g[y * LW + x - 1]) > 28 ? 1 : 0; row += e; tot += e;
+      I[(y + 1) * (LW + 1) + x + 1] = I[y * (LW + 1) + x + 1] + row; } }
+  const sum = (x, y, w, hh) => I[(y + hh) * (LW + 1) + x + w] - I[y * (LW + 1) + x + w] - I[(y + hh) * (LW + 1) + x] + I[y * (LW + 1) + x];
+  const mean = tot / (LW * LH); let best = null;
+  for (const sc of [0.2, 0.28, 0.38, 0.5]) {
+    const w = Math.round(LW * sc), hh = Math.max(6, Math.round(w / 2.2));
+    if (hh >= LH) continue;
+    for (let y = 0; y + hh <= LH; y += 2) for (let x = 0; x + w <= LW; x += 2) {
+      const dens = sum(x, y, w, hh) / (w * hh), score = dens * (1 + 0.35 * sc);
+      if (!best || score > best.score) best = { score, dens, x, y, w, hh };
+    }
+  }
+  if (!best || best.dens < 0.09 || best.dens < mean * 2.2) return null;
+  const pad = 0.12;
+  const bx = Math.max(0, best.x - best.w * pad), by = Math.max(0, best.y - best.hh * pad * 2);
+  const bw = Math.min(LW - bx, best.w * (1 + 2 * pad)), bh = Math.min(LH - by, best.hh * (1 + 4 * pad));
+  return { x: bx / LW, y: by / LH, w: bw / LW, h: bh / LH };
+}
+function trackPlate(video, guide) {
+  const f = findPlate(video, video.videoWidth, video.videoHeight), now = performance.now();
+  if (f) { lockSeen = now; for (const k of ["x", "y", "w", "h"]) curBox[k] += (f[k] - curBox[k]) * 0.35; }
+  else if (now - lockSeen > 1500) for (const k of ["x", "y", "w", "h"]) curBox[k] += (DEF_BOX[k] - curBox[k]) * 0.2;
+  placeGuide(video, guide, now - lockSeen < 1500);
+}
+function placeGuide(video, guide, locked) {
+  if (!locked && !lockOn) { guide.style.cssText = ""; return; }
+  const r = video.getBoundingClientRect(), vw = video.videoWidth, vh = video.videoHeight;
+  const sc = Math.max(r.width / vw, r.height / vh), ox = (r.width - vw * sc) / 2, oy = (r.height - vh * sc) / 2;   // object-fit: cover
+  guide.style.cssText = `left:${ox + curBox.x * vw * sc}px;top:${oy + curBox.y * vh * sc}px;width:${curBox.w * vw * sc}px;height:${curBox.h * vh * sc}px;transform:none;max-width:none;aspect-ratio:auto;${locked ? "border-color:var(--accent)" : ""}`;
+}
+
 function stopWatch() { clearInterval(watchTimer); watchTimer = null; document.querySelector(".guide")?.classList.remove("steady"); }
 
-async function smartBurst(video, say) {
+async function smartBurst(video, say, opt = {}) {
   clearInterval(watchTimer); watchTimer = null;
   while (grabbing) await settle(30);
   const tap = Date.now(), shots = [];
   if (firstShot && tap - firstShot.at < FIRST_MAX_AGE) shots.push(firstShot);
   shots.push(...preroll);
-  const end = performance.now() + BONUS_MS;
-  for (let i = 1; i <= BONUS_MAX && performance.now() < end; i++) {
-    say(`Bonus round ${i}… hold still`);
+  const end = performance.now() + (opt.night ? 4000 : BONUS_MS), max = opt.night ? 16 : BONUS_MAX;
+  for (let i = 1; i <= max && performance.now() < end; i++) {
+    say(opt.night ? `Night frame ${i}… hold very still` : `Bonus round ${i}… hold still`);
+    if (lockOn) trackPlate(video, document.querySelector(".guide"));
     const m = measure(video, video.videoWidth, video.videoHeight); lastMove = m.move;
     shots.push(await grabFrame(video, "bonus", { round: i }));
     await settle(60);
@@ -680,11 +743,13 @@ async function smartBurst(video, say) {
   shots.sort((a, b) => a.at - b.at);
   shots.forEach((s) => (s.smart.seconds_before_tap = +((tap - s.at) / 1000).toFixed(1)));
   [...shots].sort((a, b) => b.smart.sharpness - a.smart.sharpness).forEach((s, i) => (s.smart.rank = i + 1));
+  if (opt.night) shots.forEach((s) => (s.smart.night = true));
   firstShot = null; preroll = [];
   return shots;
 }
 
-const roleName = (s) => (s.smart.role === "first_shot" ? "First Shot" : s.smart.role === "steadying" ? "While steadying" : `Bonus round ${s.smart.round}`);
+const roleName = (s) => (s.smart.role === "first_shot" ? "First Shot" : s.smart.role === "steadying" ? "While steadying" : s.smart.role === "video_frame" ? `Video at ${s.smart.time_s}s`
+  : s.smart.night ? `Night frame ${s.smart.round}` : `Bonus round ${s.smart.round}`);
 function smartReview(shots, urls) {
   const top = Math.max(...shots.map((s) => s.smart.sharpness), 1);
   const best = shots.map((s, i) => ({ s, u: urls[i] })).filter((x) => x.s.smart.rank <= 3).sort((a, b) => a.s.smart.rank - b.s.smart.rank);
@@ -692,11 +757,221 @@ function smartReview(shots, urls) {
     h("div", { class: "best" }, best.map(({ s, u }) => h("figure", {},
       h("img", { src: u, alt: `Sharpest #${s.smart.rank}` }),
       h("span", { class: s.smart.rank === 1 ? "tag top" : "tag" }, `#${s.smart.rank} sharpest`),
-      h("figcaption", {}, `${roleName(s)} · ${s.smart.seconds_before_tap > 0 ? s.smart.seconds_before_tap + "s before tap" : "after tap"}${s.smart.steady ? " · steady ✓" : ""}`,
+      h("figcaption", {}, `${roleName(s)}${s.smart.seconds_before_tap == null ? "" : s.smart.seconds_before_tap > 0 ? " · " + s.smart.seconds_before_tap + "s before tap" : " · after tap"}${s.smart.steady ? " · steady ✓" : ""}`,
         h("div", { class: "meter" }, h("i", { style: `width:${Math.round((s.smart.sharpness / top) * 100)}%` })))))),
-    h("p", { class: "small muted" }, `All ${shots.length} frames, in order. All of them are sent: blurry ones still help PlateTrace build a sharper copy.`),
+    h("p", { class: "small muted" }, `All ${shots.length} frames, in order. All of them are sent: blurry ones still help build a sharper copy.`),
     h("div", { class: "grid" }, shots.map((s, i) => h("figure", {}, h("img", { src: urls[i], alt: roleName(s) }),
       h("span", { class: s.smart.rank === 1 ? "tag top" : "tag" }, s.smart.role === "first_shot" ? "1st" : `#${s.smart.rank}`)))));
+}
+
+// ---------- Upload a clip or photo (dashcam, doorbell camera, phone gallery) ----------
+// The original file is fingerprinted as it is chosen and sent unchanged. It was not taken by this camera,
+// so it is marked "uploaded_file" for investigators; detail lost before upload can't come back.
+function uploadButton(small) {
+  const input = h("input", { type: "file", accept: "video/*,image/*", style: "display:none" });
+  input.addEventListener("change", async () => { const f = input.files[0]; input.value = ""; if (f) await handleUpload(f); });
+  const btn = h("button", { class: "ghost", style: small ? "" : "width:100%", onclick: () => input.click() }, small ? "Upload" : "⬆ Upload a dashcam / doorbell clip or photo");
+  return h("span", {}, btn, input);
+}
+async function handleUpload(file) {
+  stopVoice(); stopCamera();
+  $app.replaceChildren(h("div", { class: "screen" }, h("div", { class: "intro" }, h("h1", {}, "Reading your file…"), h("p", { class: "muted" }, file.name))));
+  if (file.size > MAX_BYTES) return uploadError(`That file is ${(file.size / 1048576).toFixed(0)} MB. The limit is ${MAX_BYTES / 1048576} MB; trim the clip to the seconds with the vehicle and try again.`);
+  const isVid = file.type.startsWith("video/") || /\.(mp4|mov|m4v|webm|avi|mkv)$/i.test(file.name);
+  const ext = (file.name.match(/\.([a-z0-9]{2,5})$/i) || [, isVid ? "mp4" : "jpg"])[1].toLowerCase();
+  const shot = { kind: isVid ? "video" : "photo", blob: file, at: new Date(file.lastModified || Date.now()), sha256: await sha256(file), mime: file.type || (isVid ? "video/mp4" : "image/jpeg"), ext,
+    source_type: "uploaded_file", uploaded: { name: file.name.slice(0, 120), bytes: file.size, file_modified: new Date(file.lastModified || Date.now()).toISOString(), chosen_at: new Date().toISOString() } };
+  if (!isVid) return review([shot]);
+  try {
+    const frames = await pickVideoFrames(shot, (t) => $app.querySelector("p").textContent = t);
+    review([shot, ...frames]);
+  } catch (e) { review([shot]); }
+}
+function uploadError(t) { $app.replaceChildren(h("div", { class: "screen" }, h("div", { class: "intro" }, h("h1", {}, "Can't use that file"), h("p", {}, t), h("button", { style: "width:100%", onclick: () => go() }, "Back")))); }
+
+// ---------- Video frame picker: the sharpest moments in a video ----------
+async function pickVideoFrames(vshot, say) {
+  const url = URL.createObjectURL(vshot.blob), v = document.createElement("video");
+  v.muted = true; v.playsInline = true; v.preload = "auto"; v.src = url;
+  await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = () => rej(new Error("this phone can't open that video type")); setTimeout(() => rej(new Error("the video took too long to open")), 15000); });
+  const dur = isFinite(v.duration) ? v.duration : 0;
+  if (!dur || !v.videoWidth) { URL.revokeObjectURL(url); throw new Error("the video has no readable frames"); }
+  const seek = (t) => new Promise((res) => { v.onseeked = () => res(); v.currentTime = t; });
+  const N = Math.min(80, Math.max(8, Math.round(dur * 6))), scored = [];
+  const saveBox = curBox; curBox = { ...DEF_BOX };
+  for (let i = 0; i < N; i++) {
+    const t = Math.min(dur - 0.05, ((i + 0.5) / N) * dur); await seek(t);
+    const f = findPlate(v, v.videoWidth, v.videoHeight), box = f || DEF_BOX;
+    prevGray = null; const m = measure(v, v.videoWidth, v.videoHeight, box);
+    scored.push({ t, sharp: m.sharp, box, locked: !!f });
+    say(`Checking frame ${i + 1} of ${N}…`);
+  }
+  // keep the 6 sharpest, at least 0.3 s apart
+  const keep = [];
+  for (const c of scored.slice().sort((a, b) => b.sharp - a.sharp)) { if (keep.every((k) => Math.abs(k.t - c.t) > 0.3)) keep.push(c); if (keep.length === 6) break; }
+  keep.sort((a, b) => a.t - b.t);
+  const out = [];
+  for (const k of keep) {
+    await seek(k.t);
+    const c = document.createElement("canvas"); c.width = v.videoWidth; c.height = v.videoHeight; c.getContext("2d").drawImage(v, 0, 0);
+    const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.95)); c.width = c.height = 0;
+    out.push({ kind: "photo", blob, at: new Date(vshot.at.getTime() + k.t * 1000), sha256: await sha256(blob), mime: "image/jpeg", source_type: "derivative",
+      smart: { role: "video_frame", time_s: +k.t.toFixed(2), sharpness: Math.round(k.sharp), box: k.box, plate_lock: k.locked, from_video_sha256: vshot.sha256 } });
+  }
+  [...out].sort((a, b) => b.smart.sharpness - a.smart.sharpness).forEach((s, i) => (s.smart.rank = i + 1));
+  curBox = saveBox; URL.revokeObjectURL(url);
+  return out;
+}
+
+// ---------- Clearer copy: stack → measure the blur → unblur preview → Texas Match ----------
+// 1. Line up the sharpest frames on the plate and average them (night frames get brightened after).
+// 2. Measure the blur from the gray ramp at the letter edges (PlateTrace's own measurement).
+// 3. Unblur with Richardson–Lucy using that measured blur; nothing is drawn in.
+// 4. Texas Match: real Texas letter shapes, blurred the same way, compared with the plate. Leads only.
+const loaded = {};
+function loadScript(src) { return (loaded[src] ||= new Promise((res, rej) => { const e = document.createElement("script"); e.src = src; e.onload = res; e.onerror = () => { delete loaded[src]; rej(new Error("couldn't load " + src)); }; document.head.append(e); })); }
+const clampN = (v, a, b) => (v < a ? a : v > b ? b : v);
+const STATES = [["tx", "Texas (Classic ABC-1234)"]];   // more states are added the same way, one letter-shape set each
+
+async function plateCrop(shot, W) {
+  const bmp = await createImageBitmap(shot.blob), b = shot.smart?.box || DEF_BOX;
+  const pad = 0.08, x = Math.max(0, (b.x - b.w * pad) * bmp.width), y = Math.max(0, (b.y - b.h * pad) * bmp.height);
+  const w = Math.min(bmp.width - x, b.w * (1 + 2 * pad) * bmp.width), hh = Math.min(bmp.height - y, b.h * (1 + 2 * pad) * bmp.height);
+  const H = Math.round((W * hh) / w), c = document.createElement("canvas"); c.width = W; c.height = H;
+  const ctx = c.getContext("2d", { willReadFrequently: true }); ctx.imageSmoothingQuality = "high"; ctx.drawImage(bmp, x, y, w, hh, 0, 0, W, H); bmp.close?.();
+  return { img: ctx.getImageData(0, 0, W, H), scale: W / w };
+}
+function grayOfImg(img) { const g = new Float32Array(img.width * img.height); for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * img.data[j] + 0.587 * img.data[j + 1] + 0.114 * img.data[j + 2]; return g; }
+function bestShift(ref, g, W, H, R, step, cx = 0, cy = 0) {
+  let best = { dx: cx, dy: cy, e: Infinity };
+  const x0 = Math.floor(W * 0.15), x1 = Math.floor(W * 0.85), y0 = Math.floor(H * 0.15), y1 = Math.floor(H * 0.85);
+  for (let dy = cy - R; dy <= cy + R; dy++) for (let dx = cx - R; dx <= cx + R; dx++) {
+    let e = 0, n = 0;
+    for (let y = y0; y < y1; y += step) { const yy = y + dy; if (yy < 0 || yy >= H) continue;
+      for (let x = x0; x < x1; x += step) { const xx = x + dx; if (xx < 0 || xx >= W) continue; e += Math.abs(ref[y * W + x] - g[yy * W + xx]); n++; } }
+    e /= Math.max(1, n); if (e < best.e) best = { dx, dy, e };
+  }
+  return best;
+}
+async function stackFrames(shots, W, night, say) {
+  const ref = await plateCrop(shots[0], W), Hh = ref.img.height, rg = grayOfImg(ref.img);
+  const acc = new Float32Array(W * Hh * 3), cnt = new Float32Array(W * Hh), used = [];
+  const add = (img, dx, dy, wt) => { for (let y = 0; y < Hh; y++) { const yy = y + dy; if (yy < 0 || yy >= Hh) continue;
+    for (let x = 0; x < W; x++) { const xx = x + dx; if (xx < 0 || xx >= W) continue; const j = (yy * W + xx) * 4, i = y * W + x;
+      acc[i * 3] += wt * img.data[j]; acc[i * 3 + 1] += wt * img.data[j + 1]; acc[i * 3 + 2] += wt * img.data[j + 2]; cnt[i] += wt; } } };
+  add(ref.img, 0, 0, 1); used.push({ sha256: shots[0].sha256, dx: 0, dy: 0 });
+  for (let k = 1; k < shots.length; k++) {
+    say(`Lining up frame ${k + 1} of ${shots.length}…`); await settle(0);
+    const c = await plateCrop(shots[k], W); if (c.img.height !== Hh) continue;
+    const g = grayOfImg(c.img), R = Math.round(W * 0.04);
+    let s1 = bestShift(rg, g, W, Hh, R, 4); s1 = bestShift(rg, g, W, Hh, 2, 1, s1.dx, s1.dy);
+    if (s1.e > 40) continue;                          // didn't line up (different scene): leave it out
+    const wt = night ? 1 : clampN((shots[k].smart?.sharpness || 1) / (shots[0].smart?.sharpness || 1), 0.4, 1);
+    add(c.img, s1.dx, s1.dy, wt); used.push({ sha256: shots[k].sha256, dx: s1.dx, dy: s1.dy, weight: +wt.toFixed(2) });
+  }
+  const out = new ImageData(W, Hh);
+  for (let i = 0; i < W * Hh; i++) { const n = cnt[i] || 1; out.data[i * 4] = acc[i * 3] / n; out.data[i * 4 + 1] = acc[i * 3 + 1] / n; out.data[i * 4 + 2] = acc[i * 3 + 2] / n; out.data[i * 4 + 3] = 255; }
+  let gain = null;
+  if (night) {                                        // brighten: stretch the 1%–99% brightness range of the real pixels
+    const g = grayOfImg(out), srt = Float32Array.from(g).sort(), lo = srt[Math.floor(srt.length * 0.01)], hi = srt[Math.floor(srt.length * 0.99)], span = Math.max(8, hi - lo);
+    for (let j = 0; j < out.data.length; j += 4) for (let c = 0; c < 3; c++) out.data[j + c] = clampN(((out.data[j + c] - lo) / span) * 255, 0, 255);
+    gain = { from: [Math.round(lo), Math.round(hi)], to: [0, 255] };
+  }
+  return { img: out, used, scale: ref.scale, gain };
+}
+function gaussBlurF(src, w, hh, sig) {
+  const r = Math.max(1, Math.ceil(sig * 3)), k = []; let s = 0;
+  for (let i = -r; i <= r; i++) { const v = Math.exp(-(i * i) / (2 * sig * sig)); k.push(v); s += v; }
+  for (let i = 0; i < k.length; i++) k[i] /= s;
+  const tmp = new Float32Array(src.length), out = new Float32Array(src.length);
+  for (let y = 0; y < hh; y++) for (let x = 0; x < w; x++) { let a = 0; for (let i = -r; i <= r; i++) a += k[i + r] * src[y * w + clampN(x + i, 0, w - 1)]; tmp[y * w + x] = a; }
+  for (let y = 0; y < hh; y++) for (let x = 0; x < w; x++) { let a = 0; for (let i = -r; i <= r; i++) a += k[i + r] * tmp[clampN(y + i, 0, hh - 1) * w + x]; out[y * w + x] = a; }
+  return out;
+}
+async function unblurGray(img, sigma, iters, say) {      // Richardson–Lucy, Gaussian blur of the measured size
+  const w = img.width, hh = img.height, obs = grayOfImg(img).map((v) => v + 1);
+  let est = Float32Array.from(obs);
+  for (let it = 0; it < iters; it++) {
+    const conv = gaussBlurF(est, w, hh, sigma), ratio = new Float32Array(obs.length);
+    for (let i = 0; i < obs.length; i++) ratio[i] = obs[i] / (conv[i] + 1e-3);
+    const corr = gaussBlurF(ratio, w, hh, sigma);
+    for (let i = 0; i < est.length; i++) est[i] = clampN(est[i] * corr[i], 0, 400);
+    say(`Unblurring… ${Math.round(((it + 1) / iters) * 100)}%`); await settle(0);
+  }
+  const out = new ImageData(w, hh);
+  for (let i = 0; i < est.length; i++) { const v = clampN(est[i] - 1, 0, 255); out.data[i * 4] = out.data[i * 4 + 1] = out.data[i * 4 + 2] = v; out.data[i * 4 + 3] = 255; }
+  return out;
+}
+// The Match test needs the plate itself, edge to edge: find the bright plate rectangle inside the crop.
+function tightPlate(img) {
+  const w = img.width, hh = img.height, g = grayOfImg(img), hist = new Float32Array(256);
+  for (const v of g) hist[Math.round(v)]++;
+  let sum = 0, sumB = 0, wB = 0, best = 0, thr = 128; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  for (let t = 0; t < 256; t++) { wB += hist[t]; if (!wB) continue; const wF = g.length - wB; if (!wF) break; sumB += t * hist[t];
+    const mB = sumB / wB, mF = (sum - sumB) / wF, v = wB * wF * (mB - mF) ** 2; if (v > best) { best = v; thr = t; } }   // Otsu
+  const span = (prof, lim) => { let bi = 0; for (let i = 0; i < prof.length; i++) if (prof[i] > prof[bi]) bi = i;
+    let a = bi, b = bi; while (a > 0 && prof[a - 1] > lim) a--; while (b < prof.length - 1 && prof[b + 1] > lim) b++; return [a, b]; };
+  const rows = new Float32Array(hh); for (let y = 0; y < hh; y++) { let n = 0; for (let x = 0; x < w; x++) if (g[y * w + x] > thr) n++; rows[y] = n / w; }
+  const [y0, y1] = span(rows, 0.3);
+  const cols = new Float32Array(w); for (let x = 0; x < w; x++) { let n = 0; for (let y = y0; y <= y1; y++) if (g[y * w + x] > thr) n++; cols[x] = n / (y1 - y0 + 1); }
+  const sm = cols.map((_, x) => Math.max(cols[Math.max(0, x - 3)], cols[x], cols[Math.min(w - 1, x + 3)]));
+  const [x0, x1] = span(sm, 0.45);
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+  if (bw < w * 0.3 || bh < hh * 0.3 || bw / bh < 1.4 || bw / bh > 3.2) return img;          // no clear plate: use the whole crop
+  const c = document.createElement("canvas"); c.width = w; c.height = hh; c.getContext("2d").putImageData(img, 0, 0);
+  return c.getContext("2d").getImageData(x0, y0, bw, bh);
+}
+const imgCanvas = (img) => { const c = h("canvas", {}); c.width = img.width; c.height = img.height; c.getContext("2d").putImageData(img, 0, 0); return c; };
+
+function clearerPanel(allShots, photos, auto) {
+  const night = photos.some((s) => s.smart?.night);
+  const stateSel = h("select", {}, STATES.map(([k, l]) => h("option", { value: k }, l)), h("option", { value: "", disabled: true }, "Other states: coming soon"));
+  const status = h("p", { class: "small muted" }, photos.length > 1 ? `Lines up the ${Math.min(8, photos.length)} sharpest frames on the plate, measures the blur, then unblurs and checks the letters.` : "Measures the blur on this photo, then unblurs it and checks the letters.");
+  const out = h("div", {});
+  const go = h("button", { style: "width:100%;margin-top:6px", onclick: () => run() }, night ? "Build night copy" : "Build clearer copy");
+  async function run() {
+    go.disabled = true; out.replaceChildren(); const say = (t) => (status.textContent = t);
+    try {
+      say("Loading PlateTrace's measuring tools…");
+      await Promise.all([loadScript("../integrity.js"), loadScript("../match.js")]);
+      const use = photos.filter((s) => s.smart || photos.length === 1).sort((a, b) => (a.smart?.rank || 1) - (b.smart?.rank || 1)).slice(0, night ? 16 : 8);
+      const first = await plateCrop(use[0], 100), nat = 100 / first.scale;   // native crop width in original pixels
+      const W = Math.round(clampN(nat * 2, 240, 900));
+      const st = await stackFrames(use, W, night, say);
+      const up = st.scale;
+      say("Measuring the blur from the gray at the letter edges…"); await settle(0);
+      const A = PTIntegrity.assess({ img: st.img, frames: null, source_type: use[0].source_type === "uploaded_file" ? "processed_image" : "processed_image", ops: ["frame stacking"], up });
+      const sigW = A.measurements.blur_sigma_px != null ? A.measurements.blur_sigma_px * up : null;
+      let ub = null;
+      if (sigW && sigW >= 0.6 && A.measurements.edges_measured >= 20) ub = await unblurGray(st.img, Math.min(sigW, 12), 14, say);
+      let M = null;
+      if (stateSel.value === "tx") { say("Texas Match: comparing real Texas letter shapes, blurred the same way…"); M = await PTMatch.run(tightPlate(ub || st.img), {}, (f) => say(`Texas Match… ${Math.round(f * 100)}%`)); }
+      say("");
+      const conf = Math.round((A.confidence || 0) * 100);
+      out.replaceChildren(
+        h("p", { class: "small", style: "margin:8px 0 4px" }, h("b", {}, `Combined copy (${st.used.length} frame${st.used.length === 1 ? "" : "s"}${night ? ", brightened" : ""})`)), imgCanvas(st.img),
+        ub ? h("p", { class: "small", style: "margin:10px 0 4px" }, h("b", {}, "Unblurred preview")) : null, ub ? imgCanvas(ub) : null,
+        h("p", { class: "small muted" }, A.measurements.blur_sigma_px != null
+          ? `Blur measured: about ${A.blur_radius_est} px wide in the original, from ${A.measurements.edges_measured} letter edges. Letter strokes: ${A.stroke_width_est ?? "not measurable"} px. ${A.signal_present ? "The letters are wider than the blur, so real detail is there to recover." : "The blur is as wide as the letters or the edges are too faint, so detail may not be recoverable."} Confidence ${conf}%.`
+          : "Not enough clear letter edges to measure the blur, so no unblur was run. Try a closer or steadier capture."),
+        M ? h("div", { class: "match" }, h("p", { class: "small", style: "margin:10px 0 4px" }, h("b", {}, "Texas Match (lead, not an identification)")),
+          h("div", { class: "plate" }, [...M.mask].map((ch, i) => h("span", { class: ch === "?" ? "q" : "" }, ch, i === 2 ? h("i", {}, "") : null))),
+          h("p", { class: "small muted" }, `Fit ${Math.round(M.fit * 100)}%${M.enough_detail ? "" : " (too weak to call any letter)"}. "?" means no single letter clearly won. Top choices: ` + M.positions.map((p) => `${p.pos}: ${p.top.map((t) => t.ch).join("/")}`).join(" · "))) : null,
+        h("p", { class: "small muted" }, "Built only from the recorded pixels: lined up, averaged and unblurred by the measured amount. Nothing is drawn in. The original frames are always sent; this copy is extra."),
+        h("button", { class: "ghost", style: "width:100%;margin-top:8px", onclick: async (e) => {
+          e.target.disabled = true;
+          const pick = ub || st.img, c = imgCanvas(pick), blob = await new Promise((r) => c.toBlob(r, "image/png"));
+          const rec = { method: `${st.used.length}-frame stack${night ? " + brightness stretch" : ""}${ub ? ` + Richardson–Lucy unblur (Gaussian sigma ${sigW.toFixed(2)} px, 14 iterations)` : ""}`, frames: st.used, brightness: st.gain,
+            assessment: { blur_radius_px: A.blur_radius_est, stroke_px: A.stroke_width_est, signal_present: A.signal_present, confidence: A.confidence, failed_checks: A.failed_checks },
+            texas_match: M ? { plate: M.plate, fit: M.fit, enough_detail: M.enough_detail, lead_only: true } : null };
+          allShots.push({ kind: "photo", blob, at: new Date(), sha256: await sha256(blob), mime: "image/png", source_type: "derivative", clearer: rec });
+          e.target.textContent = "Added ✓ (sent with the originals)";
+        } }, "Add this copy to what I send"));
+    } catch (e) { say("Couldn't build it: " + (e.message || e)); }
+    go.disabled = false;
+  }
+  if (auto) setTimeout(run, 300);
+  return { el: h("div", { class: "chan" }, h("h3", {}, night ? "Night copy" : "Clearer copy"), h("label", { class: "small" }, "Plate style: ", stateSel), status, go, out) };
 }
 
 // ---------- Color channels (a viewing aid; the original photos are never changed) ----------
