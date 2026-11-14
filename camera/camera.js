@@ -7,8 +7,21 @@
 const SB_URL = "https://wbugdujmydwmzemccbiy.supabase.co";
 const SB_KEY = "sb_publishable_4RYit1aVs5Egh3gJsx2bJA_m6Kje0ES";
 const BUCKET = "platetrace-tips";
-const MAX_VIDEO_S = 60, MAX_BYTES = 48 * 1024 * 1024, BURST = 5;
-const sb = window.supabase ? window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: false } }) : null;   // camera still works offline; sending needs this
+const SB_LIB = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js";
+const MAX_VIDEO_S = 60, MAX_BYTES = 48 * 1024 * 1024;
+// The sending library loads in the background after the camera is open, so it never slows the camera down.
+let sbP = null;
+function getSb() {
+  if (sbP) return sbP;
+  sbP = new Promise((res) => {
+    const make = () => (window.supabase ? window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: false } }) : null);
+    if (window.supabase) return res(make());
+    const el = document.createElement("script"); el.src = SB_LIB; el.async = true;
+    el.onload = () => res(make()); el.onerror = () => { sbP = null; res(null); };
+    document.head.append(el);
+  });
+  return sbP;
+}
 const $app = document.getElementById("app");
 
 function h(tag, attrs, ...kids) {
@@ -47,12 +60,12 @@ function intro() {
       h("li", {}, "Fit the plate inside the box and hold the phone still."),
       h("li", {}, "Tap the screen on the plate to focus there."),
       h("li", {}, "Glare on the plate? Tap ", h("b", {}, "Anti-glare"), "."),
-      h("li", {}, "Use ", h("b", {}, "Burst"), " for 5 quick photos. More shots help PlateTrace combine a sharper copy."),
+      h("li", {}, h("b", {}, "Smart burst"), " saves a ", h("b", {}, "First Shot"), " the moment the camera opens, keeps the sharpest frames while you steady your hands, then takes bonus rounds when you tap. The sharpest 3 go on top."),
       h("li", {}, "Video works best when you can follow the vehicle for a few seconds."),
       h("li", {}, "Hands busy? Tap ", h("b", {}, "🎤 Voice"), " and say \"camera activate\" to start recording, \"camera stop\" to finish. You can also say \"photo\", \"burst\", \"zoom in\" or \"anti-glare\".")),
     h("div", { class: "notice" }, h("b", {}, "Stay safe. "), "Never use the camera while driving, never follow or confront anyone, and only film from public places. In an emergency, call 911 first. Tips sent here are not watched in real time."),
     h("p", { class: "small muted" }, "What you send: the photo or video, the time, and your location if you allow it. Sending is anonymous unless you choose to add contact details. Only PlateTrace staff can see what you send."),
-    h("button", { style: "width:100%;margin-top:8px", onclick: () => { store.set("pt_cam_seen", "1"); startCamera(); } }, "Open the camera"),
+    h("button", { style: "width:100%;margin-top:8px", onclick: () => { askMotion(); store.set("pt_cam_seen", "1"); startCamera(); } }, "Open the camera"),
     introVoice(),
     h("p", { class: "small muted", style: "margin-top:14px" }, "Tip: add this page to your home screen to use it like an app."))));
 }
@@ -108,7 +121,7 @@ async function startCamera() {
   viewfinder();
 }
 
-function stopCamera() { stream?.getTracks().forEach((t) => t.stop()); stream = null; track = null; }
+function stopCamera() { stopWatch(); stream?.getTracks().forEach((t) => t.stop()); stream = null; track = null; }
 
 async function setAntiGlare(on) {
   antiGlare = on;
@@ -124,9 +137,11 @@ function viewfinder() {
   video.srcObject = stream;
   const dot = h("div", { class: "focus-dot", style: "opacity:0" });
   const status = h("div", { class: "status" });
-  const view = h("div", { class: "view" }, video, h("div", { class: "guide" }), dot, status);
+  const guide = h("div", { class: "guide", "data-label": "Fit the plate here" });
+  const view = h("div", { class: "view" }, video, guide, dot, status);
 
   view.addEventListener("click", async (e) => {
+    askMotion();
     if (e.target.closest("button,input")) return;
     const r = video.getBoundingClientRect(), x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
     dot.style.left = e.clientX + "px"; dot.style.top = e.clientY + "px"; dot.style.opacity = 1; setTimeout(() => (dot.style.opacity = 0), 900);
@@ -188,15 +203,16 @@ function viewfinder() {
   const left = h("div", { class: "side" }), right = h("div", { class: "side" });
   const MODES = ["photo", "burst", "video", "special"];
   const pick = (m) => { if (recorder || mode === m) return; mode = m; modeBtns.forEach((b, i) => (b.className = MODES[i] === m ? "sel" : "")); paintShutter(); };
-  const modeBtns = MODES.map((m) => h("button", { class: m === mode ? "sel" : "", onclick: () => pick(m) }, { photo: "Photo", burst: "Burst ×5", video: "Video", special: "Special light" }[m]));
+  const modeBtns = MODES.map((m) => h("button", { class: m === mode ? "sel" : "", onclick: () => pick(m) }, { photo: "Photo", burst: "Smart burst", video: "Video", special: "Special light" }[m]));
   const special = specialPanel(() => paintShutter());
   const paintShutter = () => { shutter.className = mode === "video" ? "shutter rec" : "shutter"; shutter.setAttribute("aria-label", mode === "video" ? "Start recording" : "Take photo");
-    left.textContent = mode === "burst" ? "5 quick photos" : mode === "video" ? `up to ${MAX_VIDEO_S}s` : mode === "special" ? `${SPECIAL[specialMode].frames} lossless frames` : "";
+    left.textContent = mode === "burst" ? "First Shot + bonus rounds" : mode === "video" ? `up to ${MAX_VIDEO_S}s` : mode === "special" ? `${SPECIAL[specialMode].frames} lossless frames` : "";
     special.el.style.display = mode === "special" ? "" : "none"; };
   paintShutter();
 
   let busy = false;
   shutter.addEventListener("click", async () => {
+    askMotion();
     if (mode === "video") { if (recorder) recorder.stop(); else startRecording(shutter, right, status); return; }
     if (busy) return;
     if (mode === "special") {
@@ -208,18 +224,17 @@ function viewfinder() {
     }
     busy = true;
     try {
-      const shots = [];
-      const n = mode === "burst" ? BURST : 1;
-      for (let i = 0; i < n; i++) { status.textContent = n > 1 ? `Photo ${i + 1} of ${n}…` : ""; shots.push(await takePhoto(video)); if (n > 1) await new Promise((r) => setTimeout(r, 180)); }
-      status.textContent = "";
-      review(shots);
-    } catch (e) { status.textContent = "Couldn't take the photo: " + (e.message || e); }
+      if (mode === "burst") { const shots = await smartBurst(video, (t) => (status.textContent = t)); status.textContent = ""; review(shots); }
+      else { const shot = await takePhoto(video); status.textContent = ""; review([shot]); }
+    } catch (e) { status.textContent = "Couldn't take the photo: " + (e.message || e); if (!watchTimer) startWatch(video, guide); }
     busy = false;
   });
 
   function flash(t) { status.textContent = t; setTimeout(() => { if (status.textContent === t) status.textContent = ""; }, 2200); }
 
   $app.replaceChildren(view);
+  startWatch(video, guide);
+  (window.requestIdleCallback || ((f) => setTimeout(f, 2500)))(() => getSb());
   if (resumeVoice && voiceBtn) { resumeVoice = false; setTimeout(startVoice, 300); }
   if (activateOnOpen) { activateOnOpen = false; setTimeout(() => { pick("video"); if (!recorder) shutter.click(); flash("🎤 Camera activated: recording. Say \"camera stop\" to finish."); }, 600); }
   view.append(h("div", { class: "topbar" }, voiceBtn, glareBtn, torchBtn, closeBtn),
@@ -498,10 +513,14 @@ async function switchCamera(deviceId) {
 
 // ---------- review & send ----------
 function review(shots) {
+  stopWatch();
   const wasVoice = voiceOn; stopVoice(); resumeVoice = wasVoice;
   const isVideo = shots[0].kind === "video";
   const urls = shots.map((s) => URL.createObjectURL(s.blob));
+  const smart = shots.some((s) => s.smart);
+  const chan = !isVideo && !shots[0].special ? channelPanel(smart ? shots.find((s) => s.smart.rank === 1).blob : shots[0].blob) : null;
   const media = isVideo ? h("video", { class: "media", src: urls[0], controls: true, playsinline: true })
+    : smart ? smartReview(shots, urls)
     : shots.length === 1 ? h("img", { class: "media", src: urls[0], alt: "Your photo" })
     : h("div", { class: "grid" }, urls.map((u) => h("img", { src: u, alt: "Burst photo" })));
   const note = h("textarea", { rows: 3, maxlength: 1000, placeholder: "What happened, vehicle color/make, direction it went… (optional)" });
@@ -518,6 +537,7 @@ function review(shots) {
 
   const send = async () => {
     sendBtn.disabled = true; retake.disabled = true; msg.className = "small muted"; msg.textContent = "Sending…";
+    const sb = await getSb();
     if (!sb) { msg.className = "small err"; msg.textContent = "No connection to PlateTrace right now. Save it to your phone and send it later."; sendBtn.disabled = false; retake.disabled = false; return; }
     const loc = useLoc.checked && lastFix ? lastFix : null;
     const group = uuid();
@@ -532,7 +552,7 @@ function review(shots) {
           lat: loc?.lat ?? null, lng: loc?.lng ?? null, accuracy_m: loc?.accuracy_m ?? null,
           note: note.value.trim() || null, contact: anon.checked ? null : contact.value.trim() || null,
           device: navigator.userAgent.slice(0, 400),
-          camera_settings: { group, shot: i + 1, of: shots.length, mode: s.special ? "special" : shots.length > 1 ? "burst" : s.kind, anti_glare: antiGlare,
+          camera_settings: { group, shot: i + 1, of: shots.length, mode: s.special ? "special" : shots.length > 1 ? "burst" : s.kind, smart_burst: s.smart || null, suggested_view: chan ? chan.view() : null, anti_glare: antiGlare,
             capture_mode: s.special ? SPECIAL[s.special.mode].label : null, special: s.special || null,
             source_type: s.special ? (s.special.role === "original" ? "raw_capture" : "derivative") : s.kind === "video" ? "video_frame" : "processed_image", zoom: track?.getSettings?.().zoom ?? null,
             width: track?.getSettings?.().width ?? null, height: track?.getSettings?.().height ?? null, seconds: s.seconds ?? null, location_time: loc ? new Date(loc.at).toISOString() : null },
@@ -555,9 +575,9 @@ function review(shots) {
   const save = h("button", { class: "ghost", onclick: () => shots.forEach((s, i) => { const a = h("a", { href: urls[i], download: `platetrace_${s.at.toISOString().replace(/[:.]/g, "-")}_${i + 1}${s.special ? "_" + s.special.role : ""}.${s.kind === "video" ? (s.mime.includes("mp4") ? "mp4" : "webm") : s.mime.includes("png") ? "png" : "jpg"}` }); document.body.append(a); a.click(); a.remove(); }) }, "Save to phone");
 
   $app.replaceChildren(h("div", { class: "screen" }, h("div", { class: "review" },
-    h("h2", { style: "margin:4px 0 10px" }, isVideo ? "Your video" : shots[0].special ? `${SPECIAL[shots[0].special.mode].label}: ${shots.length - 1} originals + 1 result` : shots.length > 1 ? `Your ${shots.length} photos` : "Your photo"),
+    h("h2", { style: "margin:4px 0 10px" }, isVideo ? "Your video" : smart ? `Smart burst: ${shots.length} frames, sharpest 3 on top` : shots[0].special ? `${SPECIAL[shots[0].special.mode].label}: ${shots.length - 1} originals + 1 result` : shots.length > 1 ? `Your ${shots.length} photos` : "Your photo"),
     shots[0].special ? h("p", { class: "kv" }, `Result: ${shots[shots.length - 1].special.method}. The originals are sent too; they are the evidence.`) : null,
-    media,
+    media, chan?.el,
     h("p", { class: "kv" }, `Taken ${shots[0].at.toLocaleString()} · ${(size / 1048576).toFixed(1)} MB`),
     h("p", { class: "kv" }, `Fingerprint: ${shots[0].sha256.slice(0, 16)}…`),
     h("label", { class: "check" }, useLoc, h("span", {}, "Include where this was taken ", locText)),
@@ -573,6 +593,179 @@ function done(shots) {
     h("p", {}, `PlateTrace received your ${shots[0].kind === "video" ? "video" : shots.length > 1 ? shots.length + " photos" : "photo"}. Each file was fingerprinted when you took it, so investigators can show it wasn't changed.`),
     h("p", { class: "small muted" }, "Keep your original on your phone too, in case investigators ask for it."),
     h("button", { style: "width:100%", onclick: viewfinder }, "Take another"))));
+}
+
+// ---------- Smart burst: First Shot + Bonus Rounds ----------
+// The plate is in the camera's view even while the hands are still moving; blur is the same plate smeared
+// over the split second the picture took. So the camera saves a First Shot the moment a picture appears,
+// keeps the sharpest frames while the person steadies, then takes bonus rounds on tap. Every frame is kept
+// and sent (blurry ones still help PlateTrace combine a sharper copy); the sharpest 3 are shown first.
+const BONUS_MS = 2500, BONUS_MAX = 12, PREROLL_KEEP = 3, PREROLL_MAX_AGE = 20000, FIRST_MAX_AGE = 30000;
+let firstShot = null, preroll = [], watchTimer = null, grabbing = false;
+let rot = 0, rotAt = 0, motionAsked = false, prevGray = null, lastMove = 99;
+
+function askMotion() {                       // iPhone needs a tap before it shares the motion sensor
+  if (motionAsked) return; motionAsked = true;
+  const on = () => window.addEventListener("devicemotion", (e) => { const r = e.rotationRate; if (!r || r.alpha == null) return;
+    const m = Math.hypot(r.alpha || 0, r.beta || 0, r.gamma || 0); rot = rot * 0.7 + m * 0.3; rotAt = performance.now(); });
+  if (window.DeviceMotionEvent?.requestPermission) DeviceMotionEvent.requestPermission().then((p) => p === "granted" && on()).catch(() => {});
+  else if (window.DeviceMotionEvent) on();
+}
+const sensorLive = () => performance.now() - rotAt < 1000;
+const isSteady = () => (sensorLive() ? rot < 10 : lastMove < 3.5);   // degrees/second from the sensor, or picture movement
+
+// Sharpness of the plate area (center of the view): how strongly edges stand out (variance of the Laplacian).
+const MW = 480, MH = 136, mc = document.createElement("canvas"); mc.width = MW; mc.height = MH;
+const mctx = mc.getContext("2d", { willReadFrequently: true });
+function measure(src, w, hgt) {
+  mctx.drawImage(src, w * 0.25, hgt * 0.32, w * 0.5, hgt * 0.26, 0, 0, MW, MH);
+  const d = mctx.getImageData(0, 0, MW, MH).data, g = new Float32Array(MW * MH);
+  for (let i = 0; i < g.length; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  let s = 0, s2 = 0, n = 0;
+  for (let y = 1; y < MH - 1; y++) for (let x = 1, i = y * MW + 1; x < MW - 1; x++, i++) { const l = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - MW] - g[i + MW]; s += l; s2 += l * l; n++; }
+  let move = 99;
+  if (prevGray) { let m = 0; for (let i = 0; i < g.length; i += 7) m += Math.abs(g[i] - prevGray[i]); move = m / (g.length / 7); }
+  prevGray = g;
+  return { sharp: s2 / n - (s / n) ** 2, move };
+}
+async function grabFrame(video, role, extra) {
+  const at = new Date(), c = document.createElement("canvas"); c.width = video.videoWidth; c.height = video.videoHeight;
+  c.getContext("2d").drawImage(video, 0, 0);
+  const m = measure(c, c.width, c.height), steady = isSteady();
+  const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.92));
+  c.width = c.height = 0;                  // free the memory right away
+  return { kind: "photo", blob, at, sha256: await sha256(blob), mime: "image/jpeg",
+    smart: { role, sharpness: Math.round(m.sharp), steady, motion: sensorLive() ? `${rot.toFixed(1)}°/s (motion sensor)` : `${lastMove.toFixed(1)} (picture movement)`, ...extra } };
+}
+
+function startWatch(video, guide) {
+  stopWatch(); prevGray = null; firstShot = null; preroll = [];
+  watchTimer = setInterval(async () => {
+    if (!video.videoWidth || grabbing) return;
+    const m = measure(video, video.videoWidth, video.videoHeight); lastMove = m.move;
+    const st = isSteady(); guide.classList.toggle("steady", st); guide.dataset.label = st ? "Steady ✓ good moment" : "Fit the plate here";
+    const now = Date.now();
+    preroll = preroll.filter((p) => now - p.at < PREROLL_MAX_AGE);
+    const worst = preroll.length < PREROLL_KEEP ? -1 : Math.min(...preroll.map((p) => p.smart.sharpness));
+    if (!firstShot || m.sharp > worst * 1.05) {
+      grabbing = true;
+      try {
+        if (!firstShot) firstShot = await grabFrame(video, "first_shot");
+        else { const f = await grabFrame(video, "steadying"); preroll.push(f); preroll.sort((a, b) => b.smart.sharpness - a.smart.sharpness); preroll = preroll.slice(0, PREROLL_KEEP); }
+      } catch {} finally { grabbing = false; }
+    }
+  }, 120);
+}
+function stopWatch() { clearInterval(watchTimer); watchTimer = null; document.querySelector(".guide")?.classList.remove("steady"); }
+
+async function smartBurst(video, say) {
+  clearInterval(watchTimer); watchTimer = null;
+  while (grabbing) await settle(30);
+  const tap = Date.now(), shots = [];
+  if (firstShot && tap - firstShot.at < FIRST_MAX_AGE) shots.push(firstShot);
+  shots.push(...preroll);
+  const end = performance.now() + BONUS_MS;
+  for (let i = 1; i <= BONUS_MAX && performance.now() < end; i++) {
+    say(`Bonus round ${i}… hold still`);
+    const m = measure(video, video.videoWidth, video.videoHeight); lastMove = m.move;
+    shots.push(await grabFrame(video, "bonus", { round: i }));
+    await settle(60);
+  }
+  shots.sort((a, b) => a.at - b.at);
+  shots.forEach((s) => (s.smart.seconds_before_tap = +((tap - s.at) / 1000).toFixed(1)));
+  [...shots].sort((a, b) => b.smart.sharpness - a.smart.sharpness).forEach((s, i) => (s.smart.rank = i + 1));
+  firstShot = null; preroll = [];
+  return shots;
+}
+
+const roleName = (s) => (s.smart.role === "first_shot" ? "First Shot" : s.smart.role === "steadying" ? "While steadying" : `Bonus round ${s.smart.round}`);
+function smartReview(shots, urls) {
+  const top = Math.max(...shots.map((s) => s.smart.sharpness), 1);
+  const best = shots.map((s, i) => ({ s, u: urls[i] })).filter((x) => x.s.smart.rank <= 3).sort((a, b) => a.s.smart.rank - b.s.smart.rank);
+  return h("div", {},
+    h("div", { class: "best" }, best.map(({ s, u }) => h("figure", {},
+      h("img", { src: u, alt: `Sharpest #${s.smart.rank}` }),
+      h("span", { class: s.smart.rank === 1 ? "tag top" : "tag" }, `#${s.smart.rank} sharpest`),
+      h("figcaption", {}, `${roleName(s)} · ${s.smart.seconds_before_tap > 0 ? s.smart.seconds_before_tap + "s before tap" : "after tap"}${s.smart.steady ? " · steady ✓" : ""}`,
+        h("div", { class: "meter" }, h("i", { style: `width:${Math.round((s.smart.sharpness / top) * 100)}%` })))))),
+    h("p", { class: "small muted" }, `All ${shots.length} frames, in order. All of them are sent: blurry ones still help PlateTrace build a sharper copy.`),
+    h("div", { class: "grid" }, shots.map((s, i) => h("figure", {}, h("img", { src: urls[i], alt: roleName(s) }),
+      h("span", { class: s.smart.rank === 1 ? "tag top" : "tag" }, s.smart.role === "first_shot" ? "1st" : `#${s.smart.rank}`)))));
+}
+
+// ---------- Color channels (a viewing aid; the original photos are never changed) ----------
+// Every pixel is red + green + blue light. Plate letters often stand out much more in one of the three.
+function channelPanel(blob) {
+  const cv = h("canvas", {}), boost = h("input", { type: "range", min: 1, max: 4, step: 0.1, value: 1.6 }), bl = h("span", {}, "1.6×");
+  const info = h("p", { class: "small muted", style: "margin:6px 0 0" }, "Loading…");
+  const VIEWS = [["orig", "Original"], ["r", "Red"], ["g", "Green"], ["b", "Blue"], ["color", "Color only"], ["ink", "Ink map"], ["blur", "Blur gray"]];
+  const HELP = {
+    ink: "Ink map: each pixel shown as how much black letter ink is in it (darker = more ink). Colored pixels (plate art, glare, reflections) can't be letter ink, so they're hidden as white.",
+    blur: "Blur gray: only the in-between grays, the letter smeared into the background. Solid letter is blue, background and colored pixels are white. The grays are spread out so small differences show.",
+  };
+  let view = "orig", base = null, best = null, bg0 = 220, ink0 = 30, blurPct = 0, baseInfo = "";
+  const CH = 35;                                                       // more color spread than this = not black/white/gray
+  const lum = (d, j) => 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+  const chroma = (d, j) => Math.max(d[j], d[j + 1], d[j + 2]) - Math.min(d[j], d[j + 1], d[j + 2]);
+  const inkOf = (d, j) => Math.min(1, Math.max(0, (bg0 - lum(d, j)) / Math.max(1, bg0 - ink0)));
+  const btns = VIEWS.map(([k, label]) => h("button", { class: k === view ? "sel" : "", onclick: () => { view = k; btns.forEach((b, i) => (b.className = VIEWS[i][0] === k ? "sel" : ""));
+    info.textContent = HELP[k] ? HELP[k] + (k === "blur" ? ` About ${blurPct}% of the plate area is blur gray.` : "") + " Original photo is sent unchanged." : baseInfo; draw(); } }, label));
+  boost.addEventListener("input", () => { bl.textContent = `${(+boost.value).toFixed(1)}×`; draw(); });
+  const pick = (d, j, k) => (k === "r" ? d[j] : k === "g" ? d[j + 1] : k === "b" ? d[j + 2] : Math.max(d[j], d[j + 1], d[j + 2]) - Math.min(d[j], d[j + 1], d[j + 2]));
+  function draw() {
+    if (!base) return;
+    const ctx = cv.getContext("2d");
+    if (view === "orig") { ctx.putImageData(base, 0, 0); return; }
+    if (view === "ink" || view === "blur") {
+      const d = base.data, out = new ImageData(base.width, base.height), o = out.data, k = +boost.value;
+      for (let j = 0; j < d.length; j += 4) {
+        let r, g, b;
+        if (chroma(d, j) > CH) r = g = b = 255;                          // colored: not letter ink
+        else {
+          const ink = inkOf(d, j);
+          if (view === "ink") { let v = 128 + ((1 - ink) * 255 - 128) * k; r = g = b = v < 0 ? 0 : v > 255 ? 255 : v; }
+          else if (ink >= 0.88) { r = 30; g = 70; b = 160; }             // solid letter
+          else if (ink <= 0.12) r = g = b = 255;                           // clean background
+          else { let v = 128 + ((1 - (ink - 0.12) / 0.76) * 255 - 128) * k; r = g = b = v < 0 ? 0 : v > 255 ? 255 : v; }
+        }
+        o[j] = r; o[j + 1] = g; o[j + 2] = b; o[j + 3] = 255;
+      }
+      ctx.putImageData(out, 0, 0); return;
+    }
+    const d = base.data, out = new ImageData(base.width, base.height), o = out.data, hist = new Uint32Array(256), n = d.length / 4;
+    for (let j = 0; j < d.length; j += 4) hist[pick(d, j, view)]++;
+    let lo = 0, hi = 255, c = 0;                                       // stretch the 2%–98% range, then boost
+    for (; lo < 255 && (c += hist[lo]) < n * 0.02; lo++); c = 0;
+    for (; hi > 0 && (c += hist[hi]) < n * 0.02; hi--);
+    const span = Math.max(1, hi - lo), k = +boost.value;
+    for (let j = 0; j < d.length; j += 4) { let v = ((pick(d, j, view) - lo) / span) * 255; v = 128 + (v - 128) * k; v = v < 0 ? 0 : v > 255 ? 255 : v; o[j] = o[j + 1] = o[j + 2] = v; o[j + 3] = 255; }
+    ctx.putImageData(out, 0, 0);
+  }
+  createImageBitmap(blob).then((bmp) => {
+    const sc = Math.min(1, 1100 / bmp.width); cv.width = Math.round(bmp.width * sc); cv.height = Math.round(bmp.height * sc);
+    const ctx = cv.getContext("2d", { willReadFrequently: true }); ctx.drawImage(bmp, 0, 0, cv.width, cv.height); bmp.close?.();
+    base = ctx.getImageData(0, 0, cv.width, cv.height);
+    // Which layer has the most contrast in the plate area (center)?
+    const W = cv.width, H = cv.height, sd = {};
+    for (const k of ["r", "g", "b"]) { let s = 0, s2 = 0, n = 0;
+      for (let y = Math.floor(H * 0.32); y < H * 0.58; y += 2) for (let x = Math.floor(W * 0.25); x < W * 0.75; x += 2) { const v = pick(base.data, (y * W + x) * 4, k); s += v; s2 += v * v; n++; }
+      sd[k] = Math.sqrt(Math.max(0, s2 / n - (s / n) ** 2)); }
+    best = Object.keys(sd).sort((a, b) => sd[b] - sd[a])[0];
+    // Measure this photo's own "black" (letters) and "white" (background) from the gray pixels in the plate area.
+    const hist = new Uint32Array(256); let gn = 0;
+    for (let y = Math.floor(H * 0.32); y < H * 0.58; y++) for (let x = Math.floor(W * 0.25); x < W * 0.75; x++) { const j = (y * W + x) * 4; if (chroma(base.data, j) <= CH) { hist[Math.round(lum(base.data, j))]++; gn++; } }
+    const pct = (p) => { let c = 0; for (let v = 0; v < 256; v++) if ((c += hist[v]) >= gn * p) return v; return 255; };
+    if (gn > 50) { ink0 = pct(0.03); bg0 = Math.max(ink0 + 20, pct(0.95)); }
+    let bc = 0, bt = 0;
+    for (let y = Math.floor(H * 0.32); y < H * 0.58; y += 2) for (let x = Math.floor(W * 0.25); x < W * 0.75; x += 2) { const j = (y * W + x) * 4; bt++; if (chroma(base.data, j) <= CH) { const i = inkOf(base.data, j); if (i > 0.12 && i < 0.88) bc++; } }
+    blurPct = Math.round((bc / Math.max(1, bt)) * 100);
+    const name = { r: "Red", g: "Green", b: "Blue" };
+    btns.forEach((b, i) => { if (VIEWS[i][0] === best) b.textContent = `${name[best]} ★`; });
+    info.textContent = baseInfo = `Letters measured at ${ink0}, background at ${bg0} (0 = black, 255 = white). ★ ${name[best]} has the most contrast in the plate area. Tap each layer and pick the one where the letters are clearest. This is only a view: the original photo is sent unchanged.`;
+    draw();
+  }).catch(() => (info.textContent = "This phone couldn't open the photo for color layers."));
+  return { el: h("div", { class: "chan" }, h("h3", {}, "Color channels"), cv, h("div", { class: "views" }, btns), h("div", { class: "row" }, "Color boost", boost, bl), info),
+    view: () => ({ view, boost: +boost.value, highest_contrast: best, letter_level: ink0, background_level: bg0, blur_gray_pct: blurPct }) };
 }
 
 // ---------- start ----------
