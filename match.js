@@ -19,11 +19,12 @@ const PTMatch = (() => {
   const PATTERN = "LLLNNNN";
 
   let glyphs = null, meta = null;
+  const BASE = document.currentScript ? document.currentScript.src : location.href;   // works from /camera/ too
   const pause = () => new Promise((r) => setTimeout(r, 0));
 
   async function load() {
     if (glyphs) return;
-    const res = await fetch("tx_glyphs/tx_glyphs.json");
+    const res = await fetch(new URL("tx_glyphs/tx_glyphs.json", BASE));
     meta = await res.json();
     glyphs = {};
     for (const [k, arr] of Object.entries(meta.glyphs)) {
