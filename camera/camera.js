@@ -596,7 +596,7 @@ function review(shots, opt = {}) {
   const save = h("button", { class: "ghost", onclick: () => shots.forEach((s, i) => { const a = h("a", { href: urls[i], download: `platetrace_${s.at.toISOString().replace(/[:.]/g, "-")}_${i + 1}${s.special ? "_" + s.special.role : ""}.${s.kind === "video" ? (s.mime.includes("mp4") ? "mp4" : "webm") : s.mime.includes("png") ? "png" : "jpg"}` }); document.body.append(a); a.click(); a.remove(); }) }, "Save to phone");
 
   $app.replaceChildren(h("div", { class: "screen" }, h("div", { class: "review" },
-    h("h2", { style: "margin:4px 0 10px" }, isVideo ? (shots[0].uploaded ? "Your clip" : "Your video") : vids.length && smart ? `Video + ${photos.length} sharpest frames` : smart ? `${photos[0].smart.night ? "Night" : "Smart burst"}: ${shots.length} frames, sharpest 3 on top` : shots[0].special ? `${SPECIAL[shots[0].special.mode].label}: ${shots.length - 1} originals + 1 result` : shots.length > 1 ? `Your ${shots.length} photos` : "Your photo"),
+    h("h2", { style: "margin:4px 0 10px" }, isVideo ? (shots[0].uploaded ? "Your clip" : "Your video") : vids.length && smart ? `Video + ${photos.length} sharpest frames` : smart && photos[0].smart.role === "uploaded_photo" ? (photos.length > 1 ? `${photos.length} saved photos, sharpest 3 on top` : "Your saved photo") : smart ? `${photos[0].smart.night ? "Night" : "Smart burst"}: ${shots.length} frames, sharpest 3 on top` : shots[0].special ? `${SPECIAL[shots[0].special.mode].label}: ${shots.length - 1} originals + 1 result` : shots.length > 1 ? `Your ${shots.length} photos` : "Your photo"),
     shots[0].special ? h("p", { class: "kv" }, `Result: ${shots[shots.length - 1].special.method}. The originals are sent too; they are the evidence.`) : null,
     media, clear?.el, chan?.el,
     h("p", { class: "kv" }, `${shots[0].uploaded ? "Uploaded" : "Taken"} ${shots[0].at.toLocaleString()} · ${(size / 1048576).toFixed(1)} MB`),
@@ -748,7 +748,7 @@ async function smartBurst(video, say, opt = {}) {
   return shots;
 }
 
-const roleName = (s) => (s.smart.role === "first_shot" ? "First Shot" : s.smart.role === "steadying" ? "While steadying" : s.smart.role === "video_frame" ? `Video at ${s.smart.time_s}s`
+const roleName = (s) => (s.smart.role === "uploaded_photo" ? `Saved: ${s.smart.name}` : s.smart.role === "first_shot" ? "First Shot" : s.smart.role === "steadying" ? "While steadying" : s.smart.role === "video_frame" ? `Video at ${s.smart.time_s}s`
   : s.smart.night ? `Night frame ${s.smart.round}` : `Bonus round ${s.smart.round}`);
 function smartReview(shots, urls) {
   const top = Math.max(...shots.map((s) => s.smart.sharpness), 1);
@@ -768,10 +768,33 @@ function smartReview(shots, urls) {
 // The original file is fingerprinted as it is chosen and sent unchanged. It was not taken by this camera,
 // so it is marked "uploaded_file" for investigators; detail lost before upload can't come back.
 function uploadButton(small) {
-  const input = h("input", { type: "file", accept: "video/*,image/*", style: "display:none" });
-  input.addEventListener("change", async () => { const f = input.files[0]; input.value = ""; if (f) await handleUpload(f); });
-  const btn = h("button", { class: "ghost", style: small ? "" : "width:100%", onclick: () => input.click() }, small ? "Upload" : "⬆ Upload a dashcam / doorbell clip or photo");
+  const input = h("input", { type: "file", accept: "video/*,image/*", multiple: true, style: "display:none" });
+  input.addEventListener("change", async () => { const fs = [...input.files]; input.value = ""; if (fs.length) await handleUploads(fs); });
+  const btn = h("button", { class: "ghost", style: small ? "" : "width:100%", onclick: () => input.click() }, small ? "⬆ Saved" : "⬆ Use saved photos or a video (dashcam, doorbell, gallery)");
   return h("span", {}, btn, input);
+}
+// Several saved photos: score each one on the plate like a Smart burst, so Clearer copy can stack them.
+async function handleUploads(files) {
+  const vid = files.find((f) => f.type.startsWith("video/") || /\.(mp4|mov|m4v|webm|avi|mkv)$/i.test(f.name));
+  if (vid || files.length === 1) return handleUpload(vid || files[0]);
+  stopVoice(); stopCamera();
+  const say = (t) => $app.replaceChildren(h("div", { class: "screen" }, h("div", { class: "intro" }, h("h1", {}, "Reading your photos…"), h("p", { class: "muted" }, t))));
+  const shots = [], list = files.slice(0, 20);
+  for (let i = 0; i < list.length; i++) {
+    const f = list[i]; say(`Photo ${i + 1} of ${list.length}: ${f.name}`);
+    if (f.size > MAX_BYTES) continue;
+    let bmp; try { bmp = await createImageBitmap(f); } catch { continue; }
+    const box = findPlate(bmp, bmp.width, bmp.height) || DEF_BOX; prevGray = null;
+    const m = measure(bmp, bmp.width, bmp.height, box); bmp.close?.();
+    const ext = (f.name.match(/\.([a-z0-9]{2,5})$/i) || [, "jpg"])[1].toLowerCase();
+    shots.push({ kind: "photo", blob: f, at: new Date(f.lastModified || Date.now()), sha256: await sha256(f), mime: f.type || "image/jpeg", ext, source_type: "uploaded_file",
+      uploaded: { name: f.name.slice(0, 120), bytes: f.size, file_modified: new Date(f.lastModified || Date.now()).toISOString(), chosen_at: new Date().toISOString() },
+      smart: { role: "uploaded_photo", name: f.name.slice(0, 40), sharpness: Math.round(m.sharp), box, plate_lock: box !== DEF_BOX } });
+  }
+  if (!shots.length) return uploadError("None of those photos could be opened on this phone.");
+  shots.sort((a, b) => a.at - b.at);
+  [...shots].sort((a, b) => b.smart.sharpness - a.smart.sharpness).forEach((s, i) => (s.smart.rank = i + 1));
+  review(shots);
 }
 async function handleUpload(file) {
   stopVoice(); stopCamera();
@@ -781,7 +804,10 @@ async function handleUpload(file) {
   const ext = (file.name.match(/\.([a-z0-9]{2,5})$/i) || [, isVid ? "mp4" : "jpg"])[1].toLowerCase();
   const shot = { kind: isVid ? "video" : "photo", blob: file, at: new Date(file.lastModified || Date.now()), sha256: await sha256(file), mime: file.type || (isVid ? "video/mp4" : "image/jpeg"), ext,
     source_type: "uploaded_file", uploaded: { name: file.name.slice(0, 120), bytes: file.size, file_modified: new Date(file.lastModified || Date.now()).toISOString(), chosen_at: new Date().toISOString() } };
-  if (!isVid) return review([shot]);
+  if (!isVid) {
+    try { const bmp = await createImageBitmap(file); const box = findPlate(bmp, bmp.width, bmp.height); bmp.close?.(); if (box) shot.smart = { role: "uploaded_photo", name: file.name.slice(0, 40), sharpness: 0, rank: 1, box, plate_lock: true }; } catch {}
+    return review([shot]);
+  }
   try {
     const frames = await pickVideoFrames(shot, (t) => $app.querySelector("p").textContent = t);
     review([shot, ...frames]);
