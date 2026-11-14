@@ -68,8 +68,16 @@ function intro() {
     h("button", { style: "width:100%;margin-top:8px", onclick: () => { askMotion(); store.set("pt_cam_seen", "1"); startCamera(); } }, "Open the camera"),
     introVoice(),
     h("div", { style: "margin-top:10px" }, uploadButton(false)),
+    autostartSetting(),
     h("p", { class: "small muted", style: "margin-top:14px" }, "Tip: add this page to your home screen to use it like an app."),
     accountLine())));
+}
+function autostartSetting() {
+  const sel = h("select", { class: "field", onchange: (e) => store.set("pt_cam_autostart", e.target.value) },
+    h("option", { value: "" }, "Just open the camera"), Object.entries(START_MODES).map(([k, l]) => h("option", { value: k }, l)));
+  sel.value = store.get("pt_cam_autostart") || "";
+  return h("div", { class: "notice", style: "background:#0d1a26;border-color:#27445e;color:var(--text)" },
+    h("b", {}, "Emergency: start by voice. "), "Say \"Hey Google, open PT Camera\" (Android) or use a Siri Shortcut (iPhone). Choose what happens the moment it opens:", sel);
 }
 function accountLine() {
   const p = getPass(); if (!p) return null;
@@ -98,6 +106,11 @@ function introVoice() {
 // ---------- camera ----------
 let stream = null, track = null, caps = {}, settings = {}, mode = "photo", antiGlare = false, torchOn = false, recorder = null;
 let voiceOn = false, voiceRec = null, resumeVoice = false, activateOnOpen = false;
+// Emergency start: opened by voice ("Hey Google, open PT Camera" / a Siri Shortcut), a home-screen
+// shortcut (?start=video|burst|night), or the "When PT Camera opens" setting, the camera starts on its own.
+const START_MODES = { video: "Start recording", burst: "Take a Smart burst", night: "Take a Night burst" };
+let startOnce = (() => { const q = new URLSearchParams(location.search).get("start"); return START_MODES[q] ? q : START_MODES[store.get("pt_cam_autostart")] ? store.get("pt_cam_autostart") : null; })();
+if (location.search) try { history.replaceState(null, "", location.pathname + location.hash); } catch {}
 function stopVoice() { voiceOn = false; const r = voiceRec; voiceRec = null; try { r?.stop(); } catch {} document.querySelectorAll(".topbar button").forEach((b) => { if (b.textContent.includes("Voice")) b.className = "ghost"; }); }
 
 async function openStream() {
@@ -244,7 +257,10 @@ function viewfinder() {
   startWatch(video, guide);
   (window.requestIdleCallback || ((f) => setTimeout(f, 2500)))(() => getSb());
   if (resumeVoice && voiceBtn) { resumeVoice = false; setTimeout(startVoice, 300); }
-  if (activateOnOpen) { activateOnOpen = false; setTimeout(() => { pick("video"); if (!recorder) shutter.click(); flash("🎤 Camera activated: recording. Say \"camera stop\" to finish."); }, 600); }
+  if (startOnce) { const m = startOnce; startOnce = null; activateOnOpen = false;
+    (async () => { for (let i = 0; i < 60 && !(video.readyState >= 2 && video.videoWidth); i++) await settle(100);
+      pick(m); if (!(m === "video" && recorder)) shutter.click(); flash(m === "video" ? "Recording started. Tap the red button to stop." : "Capturing…"); })(); }
+  else if (activateOnOpen) { activateOnOpen = false; setTimeout(() => { pick("video"); if (!recorder) shutter.click(); flash("🎤 Camera activated: recording. Say \"camera stop\" to finish."); }, 600); }
   const lockBtn = h("button", { class: lockOn ? "ghost on" : "ghost", onclick: () => { lockOn = !lockOn; store.set("pt_cam_lock", lockOn ? "1" : "0"); lockBtn.className = lockOn ? "ghost on" : "ghost";
     if (!lockOn) { curBox = { ...DEF_BOX }; lockSeen = 0; guide.style.cssText = ""; } flash(lockOn ? "Plate lock on: the box finds and follows the plate" : "Plate lock off"); } }, "Plate lock");
   view.append(h("div", { class: "topbar" }, voiceBtn, lockBtn, glareBtn, torchBtn, uploadButton(true), closeBtn),
@@ -1100,7 +1116,7 @@ async function checkPlan() {
 }
 
 function screen(...kids) { $app.replaceChildren(h("div", { class: "screen" }, h("div", { class: "intro" }, ...kids))); }
-const go = () => (store.get("pt_cam_seen") ? startCamera() : intro());
+const go = () => (store.get("pt_cam_seen") || startOnce ? (store.set("pt_cam_seen", "1"), startCamera()) : intro());
 
 async function gate() {
   screen(h("h1", {}, "Plate", h("span", {}, "Trace"), " Camera"), h("p", { class: "muted" }, "Checking your plan…"));
