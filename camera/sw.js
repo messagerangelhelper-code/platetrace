@@ -1,6 +1,6 @@
 // Keeps the camera's own files on the phone so it opens instantly, even on a weak signal.
 // Cache first, then quietly refresh in the background for next time. Photos and videos are never cached here.
-const CACHE = "pt-camera-v6";
+const CACHE = "pt-camera-v7";
 const LIB = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js";
 const FILES = ["./", "index.html", "camera.css", "camera.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 
